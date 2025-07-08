@@ -2,7 +2,7 @@
 
 [![Language](https://img.shields.io/badge/Language-C%2B%2B-blue.svg)](https://isocpp.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/Version-2.2-blue.svg)](https://github.com/mixml/MLLog)
+[![Version](https://img.shields.io/badge/Version-2.3-blue.svg)](https://github.com/mixml/MLLog)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
 
 **[English](./README_EN.md) | 中文**
