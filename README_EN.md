@@ -11,7 +11,7 @@
 
 ## Core Features
 
-*   🚀 **Header-Only**: Just include `MLLog.hpp` in your project. No compilation or linking required.
+*   🚀 **Header-Only**: Just include `mllog.hpp` in your project. No compilation or linking required.
 *   🔒 **Thread-Safe**: All logging operations are protected by a mutex, making it safe to use in multi-threaded environments.
 *   ✨ **Dual API Styles**:
     *   **Stream API**: `MLLOG_INFO << "User " << user_id << " logged in.";`
@@ -37,16 +37,16 @@
 
 `MLLog` is a header-only library, so integration is trivial:
 
-1.  Download the `MLLog.hpp` file.
+1.  Download the `mllog.hpp` file.
 2.  Copy it into your project's source directory.
-3.  `#include "MLLog.hpp"` in your code.
+3.  `#include "mllog.hpp"` in your code.
 
 ## How to Use
 
 ### Basic Usage
 
 ```cpp
-#include "MLLog.hpp"
+#include "mllog.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -83,7 +83,7 @@ int main() {
 ### Advanced Usage
 
 ```cpp
-#include "MLLog.hpp"
+#include "mllog.hpp"
 #include <iostream>
 
 // Custom handler for MLLog's internal errors

@@ -11,7 +11,7 @@
 
 ## 核心特性
 
-*   🚀 **单头文件**: 只需将 `MLLog.hpp` 包含到你的项目中即可，无需编译或链接。
+*   🚀 **单头文件**: 只需将 `mllog.hpp` 包含到你的项目中即可，无需编译或链接。
 *   🔒 **线程安全**: 所有日志操作都由互斥锁保护，可在多线程环境中安全使用。
 *   ✨ **两种API风格**:
     *   **流式API**: `MLLOG_INFO << "User " << user_id << " logged in.";`
@@ -37,16 +37,16 @@
 
 `MLLog` 是一个纯头文件库，集成非常简单：
 
-1.  下载 `MLLog.hpp` 文件。
+1.  下载 `mllog.hpp` 文件。
 2.  将其复制到你的项目源码目录中。
-3.  在你的代码中 `#include "MLLog.hpp"`。
+3.  在你的代码中 `#include "mllog.hpp"`。
 
 ## 使用方法
 
 ### 基础用法
 
 ```cpp
-#include "MLLog.hpp"
+#include "mllog.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -83,7 +83,7 @@ int main() {
 ### 进阶用法
 
 ```cpp
-#include "MLLog.hpp"
+#include "mllog.hpp"
 #include <iostream>
 
 // 自定义日志库内部错误处理器
