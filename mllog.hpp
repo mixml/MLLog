@@ -8,6 +8,8 @@
  * @author malin
  *      - Email: zcyxml@163.com  mlin2@grgbanking.com
  *      - GitHub: https://github.com/mixml
+ * @version 2.3 (2025-07-08)
+ *      - 优化: 修改默认日志的名称.
  * @version 2.2 (2025-06-17) - (Gemini 2.5 pro)
  *      - 功能: 增加了 getLogSwitch() 函数，用于查询日志系统是否已启用。
  * @version 2.1 (2025-06-17) - (Gemini 2.5 pro)
@@ -159,6 +161,7 @@
 #pragma warning(disable : 4996)
 #else
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
@@ -565,6 +568,55 @@ public:
         }
 #endif
     }
+    static std::string get_module_path()
+    {
+        char path_buffer[1024] = {0};
+#ifdef _WIN32
+        HMODULE hModule = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&get_module_path, &hModule);
+        GetModuleFileNameA(hModule, path_buffer, sizeof(path_buffer));
+        std::string path(path_buffer);
+        size_t pos = path.find_last_of("\\/");
+        return (pos != std::string::npos) ? path.substr(0, pos) : ".";
+#else
+        Dl_info dl_info;
+        if (dladdr((void *)(&ML_Logger::get_module_path), &dl_info) && dl_info.dli_fname)
+        {
+            std::string path(dl_info.dli_fname);
+            size_t pos = path.find_last_of('/');
+            return (pos != std::string::npos) ? path.substr(0, pos) : ".";
+        }
+        return ".";
+#endif
+    }
+    std::string get_process_name()
+    {
+        char buf[1024] = {0};
+#ifdef _WIN32
+        if (GetModuleFileNameA(NULL, buf, sizeof(buf) - 1) > 0)
+        {
+            std::string name = buf;
+            size_t pos = name.find_last_of("\\/");
+            if (pos != std::string::npos)
+                name = name.substr(pos + 1);
+            pos = name.rfind('.');
+            if (pos != std::string::npos)
+                name = name.substr(0, pos);
+            return name;
+        }
+#else
+        if (readlink("/proc/self/exe", buf, sizeof(buf) - 1) > 0)
+        {
+            std::string name = buf;
+            size_t pos = name.find_last_of('/');
+            if (pos != std::string::npos)
+                name = name.substr(pos + 1);
+            return name;
+        }
+#endif
+        return "unknown_process";
+    }
 
 private:
     ML_Logger() : _logLevel(DEBUG), _outputToFile(true), _outputToScreen(true),
@@ -577,7 +629,8 @@ private:
                   _cached_time_sec(0),
                   _error_handler{} // 【新增】初始化错误处理器
     {
-        setLogFile("mllog", _maxRolls, _maxSizeInBytes);
+        std::string default_name = get_module_path() + "/log/" + get_process_name() + "_MLLOG";
+        setLogFile(default_name, _maxRolls, _maxSizeInBytes);
     }
 
     ~ML_Logger()
