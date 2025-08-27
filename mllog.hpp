@@ -9,6 +9,8 @@
  *      - Email: zcyxml@163.com  mlin2@grgbanking.com
  *      - GitHub: https://github.com/mixml
  * 变更摘要：
+ * @version 2.5 (2025-08-27)
+ *      - 性能: formatMessage_ 使用 _scprintf/_snprintf（Windows）与 snprintf（Unix, 移除 ostringstream 组装，提升性能。
  * @version 2.4 (2025-08-25 重构)
  *      - 设计: 按单一职责原则（SRP）拆分 log() 为多个私有函数：
  *      updateAndGetTimeCache_() / maybeTruncate_() / formatMessage_() /
@@ -149,11 +151,11 @@
 #include <cerrno> // errno
 #include <chrono>
 #include <cstdarg>
+#include <cstdio> // snprintf, _scprintf, _snprintf
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <functional>
-#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -176,7 +178,6 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 #endif
 
 /* ========================= ANSI 颜色 ========================= */
@@ -192,9 +193,15 @@
 #define MLLOG_EMPTY ""
 
 /* ========================= 工具 constexpr ========================= */
+// 返回 path 中最后一个分隔符后的基名指针；若无分隔符，返回 path 本身
 constexpr const char* mllog_find_last_slash_helper(const char* s, const char* last)
 {
-    return *s == '\0' ? last : mllog_find_last_slash_helper(s + 1, (*s == '/' || *s == '\\') ? s + 1 : last);
+    return (*s == '\0')
+        ? (last ? last : s)
+        : mllog_find_last_slash_helper(
+            s + 1,
+            // 只有当当前字符为分隔符且后面不是字符串终止符时，才更新 last
+            ((*s == '/' || *s == '\\') && s[1] != '\0') ? (s + 1) : last);
 }
 constexpr const char* mllog_file_name_from_path(const char* path) { return mllog_find_last_slash_helper(path, path); }
 
@@ -243,10 +250,8 @@ public:
         _initialized = false;
         _isRoll = false;
 
-        // 提取不带路径的名
         size_t p = _baseName.find_last_of("\\/");
         _baseNameWithoutPath = (p != std::string::npos) ? _baseName.substr(p + 1) : _baseName;
-
         if (_outputToFile)
         {
             std::string dir = (p != std::string::npos) ? _baseName.substr(0, p) : std::string(".");
@@ -255,7 +260,6 @@ public:
 
         _start_timestamp = currentTimestamp_();
         _baseFullNameWithDateAndTime = _baseName + "_" + _start_timestamp;
-
         if (_file.is_open())
             _file.close();
     }
@@ -291,18 +295,12 @@ public:
         if (!_log_enabled || lv < _logLevel)
             return;
 
-        // A) 获取毫秒值、更新时间缓存（内部会做跨天检测与切换）
         int ms_count = 0;
         std::tm cached_tm = {};
         updateAndGetTimeCache_(cached_tm, ms_count);
 
-        // B) 截断
-        std::string msg = maybeTruncate_(original);
-
-        // C) 格式化
+        const std::string msg = maybeTruncate_(original);
         const std::string formatted = formatMessage_(lv, file, line, msg, ms_count);
-
-        // D) 输出到各目标
         writeToTargets_(formatted, isNewLine, lv);
     }
 
@@ -342,18 +340,14 @@ public:
         std::lock_guard<std::mutex> lk(_mutex);
         if (!_outputToFile)
             return;
-
         size_t p = _baseName.find_last_of("\\/");
         std::string dir = (p != std::string::npos) ? _baseName.substr(0, p + 1) : platform_currentDirWithSlash_();
         std::string stem = (p != std::string::npos) ? _baseName.substr(p + 1) : _baseName;
-
         std::vector<std::string> files = platform_listLogFiles_(dir, stem);
         for (const auto& name : files)
         {
             if (shouldDeleteLog_(name, daysToKeep))
-            {
                 platform_deleteFile_(dir + name);
-            }
         }
     }
 
@@ -376,7 +370,7 @@ private:
             _file.close();
     }
 
-    /* ========================= SRP: 时间缓存与跨天 ========================= */
+    /* ========================= 时间缓存与跨天 ========================= */
     void updateAndGetTimeCache_(std::tm& out_tm, int& out_ms)
     {
         using clock = std::chrono::system_clock;
@@ -384,7 +378,6 @@ private:
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
         out_ms = static_cast<int>(ms.count());
         const std::time_t t = clock::to_time_t(now);
-
         if (t != _cached_time_sec)
         {
             _cached_time_sec = t;
@@ -396,7 +389,6 @@ private:
             char buf[64];
             std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &out_tm);
             _cached_time_str = buf;
-
             if (_isCheckDay)
             {
                 const int ymd = (out_tm.tm_year + 1900) * 10000 + (out_tm.tm_mon + 1) * 100 + out_tm.tm_mday;
@@ -406,14 +398,13 @@ private:
                 }
                 else if (_last_log_ymd != ymd)
                 {
-                    onDayChange_();      // 内部自锁，安全切换
-                    _last_log_ymd = ymd; // 立刻更新，避免重复触发
+                    onDayChange_();
+                    _last_log_ymd = ymd;
                 }
             }
         }
         else
         {
-            // 复用已有字符串；但 out_tm 仍需填充（为了可选扩展）
 #if defined(_WIN32)
             localtime_s(&out_tm, &_cached_time_sec);
 #else
@@ -422,7 +413,7 @@ private:
         }
     }
 
-    /* ========================= SRP: 截断 ========================= */
+    /* ========================= 截断 ========================= */
     std::string maybeTruncate_(const std::string& s) const
     {
         if (s.size() <= MAX_LOG_MESSAGE_SIZE)
@@ -432,36 +423,66 @@ private:
         return r;
     }
 
-    /* ========================= SRP: 格式化 ========================= */
+    /* ========================= 快速格式化 ========================= */
+    static const char* levelToStringC_(Level lv)
+    {
+        switch (lv)
+        {
+        case DEBUG:
+            return "DEBUG";
+        case INFO:
+            return "INFO";
+        case NOTICE:
+            return "NOTICE";
+        case WARNING:
+            return "WARNING";
+        case ERROR:
+            return "ERROR";
+        case CRITICAL:
+            return "CRITICAL";
+        case ALERT:
+            return "ALERT";
+        default:
+            return "";
+        }
+    }
+
     std::string formatMessage_(Level lv, const char* file, int line, const std::string& msg, int ms_count) const
     {
         if (_message_only)
             return msg;
-        std::ostringstream oss;
-        oss << _cached_time_str << '.' << std::setfill('0') << std::setw(3) << ms_count
-            << ' ' << levelToString_(lv) << " [" << file << ':' << line << "] " << msg;
-        return oss.str();
+        const char* level_c = levelToStringC_(lv);
+        const char* time_c = _cached_time_str.c_str();
+#if defined(_WIN32)
+        int need = _scprintf("%s.%03d %s [%s:%d] %s", time_c, ms_count, level_c, file, line, msg.c_str());
+        if (need < 0)
+            return std::string();
+        std::vector<char> buf(static_cast<size_t>(need) + 1u);
+        _snprintf(buf.data(), buf.size(), "%s.%03d %s [%s:%d] %s", time_c, ms_count, level_c, file, line, msg.c_str());
+        return std::string(buf.data(), static_cast<size_t>(need));
+#else
+        int need = std::snprintf(nullptr, 0, "%s.%03d %s [%s:%d] %s", time_c, ms_count, level_c, file, line, msg.c_str());
+        if (need < 0)
+            return std::string();
+        std::vector<char> buf(static_cast<size_t>(need) + 1u);
+        std::snprintf(buf.data(), buf.size(), "%s.%03d %s [%s:%d] %s", time_c, ms_count, level_c, file, line, msg.c_str());
+        return std::string(buf.data(), static_cast<size_t>(need));
+#endif
     }
 
-    /* ========================= SRP: 写入目标（持锁） ========================= */
+    /* ========================= 写入目标（持锁） ========================= */
     void writeToTargets_(const std::string& formatted, bool isNewLine, Level lv)
     {
         std::lock_guard<std::mutex> lk(_mutex);
-
         if (_outputToFile && !_initialized)
         {
             rollFiles_(true);
             _initialized = true;
         }
-
         if (_outputToFile)
-        {
             writeToFile_(formatted, isNewLine);
-        }
         if (_outputToScreen)
-        {
             writeToScreen_(formatted, isNewLine, lv);
-        }
     }
 
     void writeToFile_(const std::string& s, bool isNewLine)
@@ -475,7 +496,6 @@ private:
             reportError_(std::string("Failed to open file for writing. Message: ") + s);
             return;
         }
-
         const size_t newline_size = isNewLine ? (
 #if defined(_WIN32)
             2u
@@ -485,14 +505,11 @@ private:
             )
             : 0u;
         const size_t msg_size = s.size() + newline_size;
-
         if (_currentSize > 0 && (_currentSize + msg_size > _maxSizeInBytes))
             rollFiles_();
-
         _file << s << (isNewLine ? "\n" : "");
         if (_auto_flush)
             _file.flush();
-
         _currentSize += msg_size;
         if (_currentSize >= _maxSizeInBytes)
             rollFiles_();
@@ -500,13 +517,10 @@ private:
 
     void writeToScreen_(const std::string& s, bool isNewLine, Level lv)
     {
-        // 平台封装：Windows 用 Console API，其他平台使用 ANSI 码
         platform_setConsoleColor_(_log_screen_color ? lv : DEBUG);
 #if !defined(_WIN32)
         if (_log_screen_color)
-        {
             std::cout << levelColorAnsi_(lv);
-        }
 #endif
         std::cout << s << (isNewLine ? "\n" : "");
         platform_resetConsoleColor_();
@@ -540,7 +554,7 @@ private:
             reportError_("Failed to reopen log file: " + fn.str());
     }
 
-    void rollFiles_(bool first = false)
+    void rollFiles_(bool /*first*/ = false)
     {
         if (_baseName.empty())
             return;
@@ -577,12 +591,6 @@ private:
         else
             std::strftime(buf, sizeof(buf), "%Y%m%d%H%M", &lt);
         return std::string(buf);
-    }
-
-    std::string levelToString_(Level lv) const
-    {
-        static const char* s[] = { "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT" };
-        return s[lv];
     }
 
     const char* levelColorAnsi_(Level lv) const
@@ -630,7 +638,6 @@ private:
     /* ========================= 平台封装 ========================= */
     static bool platform_createDirectories_(const std::string& path)
     {
-        // 逐级创建，兼容 Windows 盘符
         std::string p = path;
         std::replace(p.begin(), p.end(), '\\', '/');
         if (p.empty())
@@ -702,7 +709,7 @@ private:
         }
         SetConsoleTextAttribute(h, (bg << 4) | fg);
 #else
-        (void)lv; // 非 Windows 使用 ANSI，在 writeToScreen_ 里处理
+        (void)lv; // 非 Windows 使用 ANSI，在 writeToScreen_ 中处理
 #endif
     }
 
@@ -712,7 +719,6 @@ private:
         HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
         SetConsoleTextAttribute(h, 7);
 #else
-        // 非 Windows：在 writeToScreen_ 写入 ANSI RESET
         std::cout << MLLOG_COLOR_RESET;
 #endif
     }
@@ -842,12 +848,11 @@ private:
 
     std::time_t parseDateFromFilename_(const std::string& filename) const
     {
-        // 预期: <stem>_YYYYMMDD[HHMM]_R.log
         if (filename.rfind(_baseNameWithoutPath + "_", 0) != 0)
             return -1;
         std::string rest = filename.substr(_baseNameWithoutPath.length() + 1);
         if (rest.size() < 8)
-            return -1; // 至少 8 位
+            return -1;
         std::string ymd = rest.substr(0, 8);
         for (char c : ymd)
         {
