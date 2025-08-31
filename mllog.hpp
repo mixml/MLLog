@@ -1,6 +1,5 @@
 #ifndef MLLOG_HPP
 #define MLLOG_HPP
-
 /**
  * @file mllog.hpp
  * @brief 多功能、跨平台、单头文件日志系统（Turbo）。
@@ -10,6 +9,12 @@
  *      - GitHub: https://github.com/mixml
  *
  * 变更摘要：
+ * @version 2.6.5 (2025-08-31 Turbo-IO)
+ *      - 性能：替换 ofstream，Windows 使用 _sopen_s/_write + 1MB 用户缓冲；Nix 使用 FILE* + setvbuf(1MB)。
+ *      - 性能：文件-only 路径将“前缀+正文+换行”合并为一次写，减少系统调用（Windows 收益显著）。
+ *      - 可靠性：写/刷失败检测与 bad() 状态；可选强刷到磁盘（MLLOG_DURABLE_FLUSH）。
+ * @version 2.6.4 (2025-08-31 Turbo-IO)
+ *      - 性能：替换ofstream和stringstream提升写日志速度。
  * @version 2.6.3 (2025-08-30 Turbo)
  *      - 性能：秒级时间串使用 TLS 缓存（localtime/strftime 仅在秒变化时执行），避免每条日志反复格式化。
  *      - 性能：二进制直写 _file.write() + put('\n')，减少 iostream 格式化开销。
@@ -183,17 +188,21 @@
 #include <vector>
 
 #if defined(_WIN32)
-#include <direct.h> // _mkdir, _getcwd
-#include <io.h>     // _findfirst, _findnext, _finddata_t, _isatty, _fileno
+#include <direct.h>
+#include <fcntl.h> // _O_*
+#include <io.h>
+#include <share.h> // _sopen_s
+#include <sys/stat.h>
+
 #pragma warning(disable : 4996)
 #else
 #include <dirent.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
-#include <unistd.h> // isatty, readlink, getcwd
+#include <unistd.h>
 #endif
 
-/* ========================= ANSI 颜色 ========================= */
+ /* ========================= ANSI 颜色 ========================= */
 #define MLLOG_COLOR_NORMAL "\x1B[0m"
 #define MLLOG_COLOR_RED "\x1B[31m"
 #define MLLOG_COLOR_GREEN "\x1B[32m"
@@ -205,6 +214,11 @@
 #define MLLOG_COLOR_RESET "\x1B[0m"
 #define MLLOG_EMPTY ""
 
+/* 可选强刷到磁盘：默认关闭。如需开启，在包含本头文件前 #define MLLOG_DURABLE_FLUSH 1 */
+#ifndef MLLOG_DURABLE_FLUSH
+#define MLLOG_DURABLE_FLUSH 0
+#endif
+
 /* Windows: 如果项目外部引入 <windows.h>，可用 VT 模式；本头不强制依赖 */
 #if defined(_WIN32)
 #ifdef ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -215,18 +229,13 @@
 #endif
 
 /* ========================= constexpr 工具 ========================= */
-constexpr const char *mllog_find_last_slash_helper(const char *s, const char *last)
+constexpr const char* mllog_find_last_slash_helper(const char* s, const char* last)
 {
-    return (*s == '\0')
-               ? (last ? last : s)
-               : mllog_find_last_slash_helper(
-                     s + 1,
-                     ((*s == '/' || *s == '\\') && s[1] != '\0') ? (s + 1) : last);
+    return (*s == '\0') ? (last ? last : s)
+        : mllog_find_last_slash_helper(
+            s + 1, ((*s == '/' || *s == '\\') && s[1] != '\0') ? (s + 1) : last);
 }
-constexpr const char *mllog_file_name_from_path(const char *path)
-{
-    return mllog_find_last_slash_helper(path, path);
-}
+constexpr const char* mllog_file_name_from_path(const char* path) { return mllog_find_last_slash_helper(path, path); }
 
 #if defined(_MSC_VER)
 #define ML_ALWAYS_INLINE __forceinline
@@ -249,7 +258,247 @@ constexpr const char *mllog_file_name_from_path(const char *path)
 #endif
 
 template <class T>
-ML_NODISCARD ML_ALWAYS_INLINE constexpr const T &ml_max(const T &a, const T &b) noexcept { return (a < b) ? b : a; }
+ML_NODISCARD ML_ALWAYS_INLINE constexpr const T& ml_max(const T& a, const T& b) noexcept { return (a < b) ? b : a; }
+
+/* ============= 轻量 ofstream 替代（Win: _open/_write + 1MB；Nix: FILE* + 1MB） ============= */
+class ML_FastOFStream
+{
+public:
+    ML_FastOFStream()
+#if defined(_WIN32)
+        : fd_(-1), len_(0), failed_(false), buf_(1 << 20)
+#else
+        : fp_(nullptr), failed_(false)
+#endif
+    {
+    }
+    ~ML_FastOFStream() { close(); }
+
+    void open(const std::string& path, std::ios::openmode mode)
+    {
+        close();
+        failed_ = false;
+#if defined(_WIN32)
+        int flags = _O_WRONLY | _O_BINARY | _O_CREAT;
+        if (mode & std::ios::trunc)
+            flags |= _O_TRUNC;
+        else if (mode & std::ios::app)
+            flags |= _O_APPEND;
+        int pmode = _S_IREAD | _S_IWRITE;
+        if (_sopen_s(&fd_, path.c_str(), flags, _SH_DENYNO, pmode) != 0)
+        {
+            fd_ = -1;
+            failed_ = true;
+            return;
+        }
+        len_ = 0;
+#else
+        const bool trunc = (mode & std::ios::trunc) != 0;
+        const bool app = (mode & std::ios::app) != 0;
+        const char* m = trunc ? "wb" : (app ? "ab" : "wb");
+        fp_ = ::fopen(path.c_str(), m);
+        if (fp_)
+            (void)::setvbuf(fp_, nullptr, _IOFBF, 1 << 20); // 1MB 全缓冲
+        failed_ = (fp_ == nullptr);
+#endif
+    }
+
+    bool is_open() const
+    {
+#if defined(_WIN32)
+        return fd_ != -1;
+#else
+        return fp_ != nullptr;
+#endif
+    }
+
+    // 单块写；常见路径下一次写满。Windows 小块先并入 1MB 缓冲，大块直写。
+    void write(const char* data, size_t n)
+    {
+        if (n == 0)
+            return;
+#if defined(_WIN32)
+        if (fd_ == -1)
+        {
+            failed_ = true;
+            return;
+        }
+        if (n < (buf_.size() >> 1))
+        { // 小块合并
+            if (len_ + n > buf_.size())
+                flush_buffer_();
+            if (n > buf_.size())
+            {
+                size_t off = 0;
+                while (off < n)
+                {
+                    unsigned chunk = (unsigned)std::min<size_t>(n - off, 1 << 20);
+                    int w = _write(fd_, data + off, chunk);
+                    if (w != (int)chunk)
+                    {
+                        failed_ = true;
+                        break;
+                    }
+                    off += (size_t)w;
+                }
+                return;
+            }
+            std::memcpy(buf_.data() + len_, data, n);
+            len_ += n;
+        }
+        else
+        { // 大块直写
+            flush_buffer_();
+            size_t off = 0;
+            while (off < n)
+            {
+                unsigned chunk = (unsigned)std::min<size_t>(n - off, 1 << 20);
+                int w = _write(fd_, data + off, chunk);
+                if (w != (int)chunk)
+                {
+                    failed_ = true;
+                    break;
+                }
+                off += (size_t)w;
+            }
+        }
+#else
+        if (!fp_)
+        {
+            failed_ = true;
+            return;
+        }
+        size_t w = ::fwrite(data, 1, n, fp_);
+        if (w != n)
+            failed_ = true;
+#endif
+    }
+
+    void put(char c)
+    {
+#if defined(_WIN32)
+        if (fd_ == -1)
+        {
+            failed_ = true;
+            return;
+        }
+        if (len_ == buf_.size())
+            flush_buffer_();
+        buf_[len_++] = c;
+#else
+        if (!fp_)
+        {
+            failed_ = true;
+            return;
+        }
+        if (::fputc((unsigned char)c, fp_) == EOF)
+            failed_ = true;
+#endif
+    }
+
+    void flush()
+    {
+#if defined(_WIN32)
+        if (fd_ == -1)
+            return;
+        flush_buffer_();
+#if MLLOG_DURABLE_FLUSH
+        if (_commit(fd_) != 0)
+            failed_ = true;
+#endif
+#else
+        if (!fp_)
+            return;
+        if (::fflush(fp_) != 0)
+            failed_ = true;
+#if MLLOG_DURABLE_FLUSH
+        if (::fsync(::fileno(fp_)) != 0)
+            failed_ = true;
+#endif
+#endif
+    }
+
+    void close()
+    {
+#if defined(_WIN32)
+        if (fd_ != -1)
+        {
+            flush_buffer_();
+            _close(fd_);
+            fd_ = -1;
+        }
+#else
+        if (fp_)
+        {
+            ::fclose(fp_);
+            fp_ = nullptr;
+        }
+#endif
+    }
+
+    void seekp(long long off, std::ios_base::seekdir dir)
+    {
+#if defined(_WIN32)
+        if (fd_ == -1)
+            return;
+        flush_buffer_();
+        int whence = (dir == std::ios_base::beg) ? SEEK_SET : (dir == std::ios_base::cur) ? SEEK_CUR
+            : SEEK_END;
+        (void)_lseeki64(fd_, off, whence);
+#else
+        if (!fp_)
+            return;
+        int whence = (dir == std::ios_base::beg) ? SEEK_SET : (dir == std::ios_base::cur) ? SEEK_CUR
+            : SEEK_END;
+        ::fseeko(fp_, (off_t)off, whence);
+#endif
+    }
+
+    std::streampos tellp()
+    {
+#if defined(_WIN32)
+        if (fd_ == -1)
+            return std::streampos(-1);
+        __int64 pos = _telli64(fd_);
+        return (pos >= 0) ? std::streampos(pos) : std::streampos(-1);
+#else
+        if (!fp_)
+            return std::streampos(-1);
+        off_t pos = ::ftello(fp_);
+        return (pos >= 0) ? std::streampos(pos) : std::streampos(-1);
+#endif
+    }
+
+    bool bad() const { return failed_; }
+    void clear_bad() { failed_ = false; }
+
+private:
+#if defined(_WIN32)
+    void flush_buffer_()
+    {
+        size_t off = 0;
+        while (off < len_)
+        {
+            unsigned chunk = (unsigned)std::min<size_t>(len_ - off, 1 << 20);
+            int w = _write(fd_, buf_.data() + off, chunk);
+            if (w != (int)chunk)
+            {
+                failed_ = true;
+                break;
+            }
+            off += (size_t)w;
+        }
+        len_ = 0;
+    }
+    int fd_;
+    size_t len_;
+    bool failed_;
+    std::vector<char> buf_;
+#else
+    FILE* fp_;
+    bool failed_;
+#endif
+};
 
 /* ========================= 核心类 ========================= */
 class ML_Logger
@@ -265,21 +514,21 @@ public:
         Critical,
         Alert
     };
-    using ErrorHandler = std::function<void(const std::string &)>;
+    using ErrorHandler = std::function<void(const std::string&)>;
 
-    static const size_t MAX_LOG_MESSAGE_SIZE = 1024u * 1024u * 5u; // 5 MB
-    static constexpr const char *TRUNCATED_MESSAGE = "\n... [Message Truncated]";
+    static const size_t MAX_LOG_MESSAGE_SIZE = 1024u * 1024u * 5u;
+    static constexpr const char* TRUNCATED_MESSAGE = "\n... [Message Truncated]";
 
-    static ML_Logger &getInstance()
+    static ML_Logger& getInstance()
     {
         static ML_Logger inst;
         return inst;
     }
 
-    ML_Logger(const ML_Logger &) = delete;
-    ML_Logger &operator=(const ML_Logger &) = delete;
-    ML_Logger(ML_Logger &&) = delete;
-    ML_Logger &operator=(ML_Logger &&) = delete;
+    ML_Logger(const ML_Logger&) = delete;
+    ML_Logger& operator=(const ML_Logger&) = delete;
+    ML_Logger(ML_Logger&&) = delete;
+    ML_Logger& operator=(ML_Logger&&) = delete;
 
     /* ========== 配置接口 ========== */
     void setLevel(Level lv) { _logLevel = lv; }
@@ -299,9 +548,9 @@ public:
     void setAutoFlush(bool enabled) { _auto_flush = enabled; }
     void setErrorHandler(ErrorHandler h) { _error_handler = std::move(h); }
 
-    void setLogFile(const std::string &baseName,
-                    int maxRolls = 5,
-                    size_t maxSizeInBytes = 100u * 1024u * 1024u)
+    void setLogFile(const std::string& baseName,
+        int maxRolls = 5,
+        size_t maxSizeInBytes = 100u * 1024u * 1024u)
     {
         std::lock_guard<std::mutex> lk(_mutex);
         _baseName = baseName;
@@ -336,26 +585,38 @@ public:
     }
 
     /* ========== 写日志接口 ========== */
-    void log(const char *file, int line, Level lv, const std::string &original, bool isNewLine = true)
+    void log(const char* file, int line, Level lv, const std::string& original, bool isNewLine = true)
     {
         if (!_log_enabled || lv < _logLevel)
             return;
 
-        // 锁外完成：时间缓存获取 & 格式化字符串拼装到 TLS 缓冲
+        // 锁外：时间缓存 & 截断 & 格式化（或仅构造前缀）
         int ms_count = 0;
         std::tm cached_tm{};
-        const char *time_c = nullptr;
+        const char* time_c = nullptr;
         updateAndGetTimeCache_(cached_tm, ms_count, time_c);
 
         const std::string msg = maybeTruncate_(original);
-        auto &formatted = tls_buf_();
-        formatMessageFast_(lv, file, line, time_c, ms_count, msg, formatted);
 
-        // 锁内：跨天切换 + 写出
+        // 文件-only：不拼整行，前缀与正文一次性写出
+        if (_outputToFile && !_outputToScreen && !_message_only)
+        {
+            char prefix[192];
+            const int plen = buildPrefix_(prefix, sizeof(prefix), lv, file, line, time_c, ms_count);
+            if (plen > 0)
+            {
+                writeToTargetsFileOnly_(prefix, (size_t)plen, msg, isNewLine, lv);
+                return;
+            }
+        }
+
+        // 需要屏幕输出或 message_only：拼到 TLS 缓冲
+        auto& formatted = tls_buf_();
+        formatMessageFast_(lv, file, line, time_c, ms_count, msg, formatted);
         writeToTargets_(formatted, isNewLine, lv);
     }
 
-    void logformat(const char *file, int line, Level lv, const char *fmt, ...)
+    void logformat(const char* file, int line, Level lv, const char* fmt, ...)
     {
         if (!_log_enabled || lv < _logLevel)
             return;
@@ -363,45 +624,31 @@ public:
         std::string s;
         va_list args;
         va_start(args, fmt);
-#if defined(_WIN32)
-        va_list cpy;
-        va_copy(cpy, args);
-        int need = _vscprintf(fmt, cpy); // 不含'\0'
-        va_end(cpy);
-        if (need < 0)
-        {
-            va_end(args);
-            return;
-        }
-        std::vector<char> tmp(static_cast<size_t>(need) + 1u);
-        int written = _vsnprintf_s(tmp.data(), tmp.size(), _TRUNCATE, fmt, args);
-        va_end(args);
-        if (written < 0)
-            return;
-        s.assign(tmp.data(), static_cast<size_t>(written));
-#else
-        std::vector<char> buf(1024);
+        std::vector<char> buf(256);
         while (true)
         {
             va_list cpy;
             va_copy(cpy, args);
+#if defined(_WIN32)
+            int need = _vsnprintf(buf.data(), buf.size(), fmt, cpy);
+#else
             int need = vsnprintf(buf.data(), buf.size(), fmt, cpy);
+#endif
             va_end(cpy);
             if (need < 0)
             {
-                va_end(args);
-                return;
+                buf.resize(buf.size() * 2);
+                continue;
             }
             if ((size_t)need >= buf.size())
             {
-                buf.resize(static_cast<size_t>(need) + 1);
+                buf.resize((size_t)need + 1);
                 continue;
             }
-            s.assign(buf.data(), static_cast<size_t>(need));
+            s.assign(buf.data(), (size_t)need);
             break;
         }
         va_end(args);
-#endif
         log(file, line, lv, s, _add_newline);
     }
 
@@ -420,7 +667,7 @@ public:
         std::string stem = (p != std::string::npos) ? _baseName.substr(p + 1) : _baseName;
 
         std::vector<std::string> files = platform_listLogFiles_(dir, stem);
-        for (const auto &name : files)
+        for (const auto& name : files)
         {
             if (shouldDeleteLog_(name, daysToKeep))
             {
@@ -431,9 +678,12 @@ public:
 
 private:
     ML_Logger()
-        : _isRoll(false), _logLevel(Level::Debug), _outputToFile(true), _outputToScreen(true), _currentRollIndex(0), _maxRolls(5), _maxSizeInBytes(100u * 1024u * 1024u), _currentSize(0), _initialized(false), _message_only(false), _add_newline(true), _log_enabled(false), _log_screen_color(true), _default_file_name_day(true), _isCheckDay(false), _start_timestamp(), _last_log_ymd(0), _auto_flush(true), _cached_time_sec(0) // 兼容旧接口（当前不做跨线程共享）
-          ,
-          _need_day_switch(false), _error_handler(nullptr)
+        : _isRoll(false), _logLevel(Level::Debug), _outputToFile(true), _outputToScreen(true),
+        _currentRollIndex(0), _maxRolls(5), _maxSizeInBytes(100u * 1024u * 1024u), _currentSize(0),
+        _initialized(false), _message_only(false), _add_newline(true), _log_enabled(false),
+        _log_screen_color(true), _default_file_name_day(true), _isCheckDay(false),
+        _start_timestamp(), _last_log_ymd(0), _auto_flush(true), _cached_time_sec(0),
+        _need_day_switch(false), _error_handler(nullptr)
     {
         std::string def = get_module_path() + "/log/" + get_process_name() + "_MLLOG";
         setLogFile(def, _maxRolls, _maxSizeInBytes);
@@ -447,12 +697,12 @@ private:
     }
 
     /* ========== 时间缓存与跨天（锁外：TLS 缓存时间串；跨天仅置原子标记） ========== */
-    void updateAndGetTimeCache_(std::tm &out_tm, int &out_ms, const char *&out_time_c)
+    void updateAndGetTimeCache_(std::tm& out_tm, int& out_ms, const char*& out_time_c)
     {
         using clock = std::chrono::system_clock;
         auto now = clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % std::chrono::seconds(1);
-        out_ms = static_cast<int>(ms.count());
+        out_ms = (int)ms.count();
 
         const std::time_t t = clock::to_time_t(now);
         struct TLS
@@ -460,7 +710,7 @@ private:
             std::time_t sec;
             std::tm tm;
             char time_buf[32];
-            TLS() : sec((std::time_t)-1), tm{} { time_buf[0] = '\0'; }
+            TLS() : sec((time_t)-1), tm{} { time_buf[0] = '\0'; }
         };
         thread_local TLS tls;
 
@@ -493,8 +743,21 @@ private:
         out_time_c = tls.time_buf;
     }
 
+    /* ========== 构造前缀（一次 snprintf） ========== */
+    static int buildPrefix_(char* buf, size_t cap, Level lv, const char* file, int line,
+        const char* time_c, int ms)
+    {
+#if defined(_WIN32)
+        return _snprintf(buf, cap, "%s.%03d %s [%s:%d] ",
+            time_c, ms, levelToStringC_(lv), file, line);
+#else
+        return std::snprintf(buf, cap, "%s.%03d %s [%s:%d] ",
+            time_c, ms, levelToStringC_(lv), file, line);
+#endif
+    }
+
     /* ========== 截断 ========== */
-    std::string maybeTruncate_(const std::string &s) const
+    std::string maybeTruncate_(const std::string& s) const
     {
         if (s.size() <= MAX_LOG_MESSAGE_SIZE)
             return s;
@@ -504,17 +767,17 @@ private:
     }
 
     // 线程局部可复用缓冲，减少分配/拷贝
-    static std::string &tls_buf_()
+    static std::string& tls_buf_()
     {
         thread_local std::string buf;
-        if (buf.capacity() < 1024)
-            buf.reserve(1024);
+        if (buf.capacity() < 256)
+            buf.reserve(256);
         buf.clear();
         return buf;
     }
 
     /* ========== 级别字符串 ========== */
-    static const char *levelToStringC_(Level lv)
+    static const char* levelToStringC_(Level lv)
     {
         switch (lv)
         {
@@ -538,42 +801,98 @@ private:
     }
 
     /* ========== 快速格式化到 TLS 缓冲 ========== */
-    void formatMessageFast_(Level lv, const char *file, int line,
-                            const char *time_c, int ms_count,
-                            const std::string &msg, std::string &out) const
+    void formatMessageFast_(Level lv, const char* file, int line,
+        const char* time_c, int ms_count,
+        const std::string& msg, std::string& out) const
     {
         if (_message_only)
         {
             out.assign(msg);
             return;
         }
-#if defined(_WIN32)
-        int need = _scprintf("%s.%03d %s [%s:%d] %s",
-                             time_c, ms_count, levelToStringC_(lv), file, line, msg.c_str());
-        if (need < 0)
+        char prefix[192];
+        int plen = buildPrefix_(prefix, sizeof(prefix), lv, file, line, time_c, ms_count);
+        if (plen < 0)
         {
-            out.clear();
+            out.assign(msg);
             return;
         }
-        out.resize(static_cast<size_t>(need));
-        _snprintf(&out[0], out.size() + 1, "%s.%03d %s [%s:%d] %s",
-                  time_c, ms_count, levelToStringC_(lv), file, line, msg.c_str());
-#else
-        int need = std::snprintf(nullptr, 0, "%s.%03d %s [%s:%d] %s",
-                                 time_c, ms_count, levelToStringC_(lv), file, line, msg.c_str());
-        if (need < 0)
-        {
-            out.clear();
-            return;
-        }
-        out.resize(static_cast<size_t>(need));
-        std::snprintf(&out[0], out.size() + 1, "%s.%03d %s [%s:%d] %s",
-                      time_c, ms_count, levelToStringC_(lv), file, line, msg.c_str());
-#endif
+        out.reserve((size_t)plen + msg.size());
+        out.append(prefix, (size_t)plen);
+        out.append(msg);
     }
 
-    /* ========== 写目标（持锁；此处执行跨天） ========== */
-    void writeToTargets_(const std::string &formatted, bool isNewLine, Level lv)
+    /* ========== 仅文件目标（持锁；一次 write 合并前缀+正文+换行） ========== */
+    void writeToTargetsFileOnly_(const char* prefix, size_t plen,
+        const std::string& msg, bool isNewLine, Level /*lv*/)
+    {
+        struct InLogGuard
+        {
+            InLogGuard() { ML_Logger::in_logging_flag_() = true; }
+            ~InLogGuard() { ML_Logger::in_logging_flag_() = false; }
+        } guard;
+        std::lock_guard<std::mutex> lk(_mutex);
+
+        if (_need_day_switch.exchange(false, std::memory_order_relaxed))
+            onDayChangeLocked_();
+
+        if (_outputToFile && !_initialized)
+        {
+            rollFiles_(true);
+            _initialized = true;
+        }
+        if (!_outputToFile)
+            return;
+
+        if (!_file.is_open())
+        {
+            rollFiles_(true);
+            _initialized = true;
+            if (!_file.is_open())
+            {
+                reportError_(std::string("Failed to open file for writing. Message prefix lost"));
+                return;
+            }
+        }
+
+        const size_t msg_size = plen + msg.size() + (isNewLine ? 1u : 0u);
+        if (_currentSize > 0 && (_currentSize + msg_size > _maxSizeInBytes))
+            rollFiles_();
+
+        // 一次 write：前缀 + 正文 + '\n'
+        {
+            const size_t total = msg_size;
+            thread_local std::vector<char> oneline;
+            if (oneline.size() < total)
+                oneline.resize(total);
+            size_t off = 0;
+            std::memcpy(oneline.data() + off, prefix, plen);
+            off += plen;
+            std::memcpy(oneline.data() + off, msg.data(), msg.size());
+            off += msg.size();
+            if (isNewLine)
+                oneline[off++] = '\n';
+            _file.write(oneline.data(), off);
+        }
+
+        if (_auto_flush)
+            _file.flush();
+
+        if (_file.bad())
+        {
+            reportError_(std::string("Log write/flush failed (file-only path)."));
+            _file.close();
+            _initialized = false;
+            return;
+        }
+
+        _currentSize += msg_size;
+        if (_currentSize >= _maxSizeInBytes)
+            rollFiles_();
+    }
+
+    /* ========== 文件+屏幕（原路径） ========== */
+    void writeToTargets_(const std::string& formatted, bool isNewLine, Level lv)
     {
         struct InLogGuard
         {
@@ -596,7 +915,7 @@ private:
             writeToScreen_(formatted, isNewLine, lv);
     }
 
-    void writeToFile_(const std::string &s, bool isNewLine)
+    void writeToFile_(const std::string& s, bool isNewLine)
     {
         if (!_outputToFile)
             return;
@@ -612,7 +931,7 @@ private:
             }
         }
 
-        const size_t msg_size = s.size() + (isNewLine ? 1u : 0u); // '\n' 1 字节
+        const size_t msg_size = s.size() + (isNewLine ? 1u : 0u);
         if (_currentSize > 0 && (_currentSize + msg_size > _maxSizeInBytes))
             rollFiles_();
 
@@ -622,6 +941,14 @@ private:
         if (_auto_flush)
             _file.flush();
 
+        if (_file.bad())
+        {
+            reportError_(std::string("Log write/flush failed."));
+            _file.close();
+            _initialized = false;
+            return;
+        }
+
         _currentSize += msg_size;
         if (_currentSize >= _maxSizeInBytes)
             rollFiles_();
@@ -630,8 +957,7 @@ private:
     /* ========== 控制台着色支持 ========== */
     static bool supportsAnsiColor_()
     {
-        static bool inited = false;
-        static bool cached = false;
+        static bool inited = false, cached = false;
         if (inited)
             return cached;
         inited = true;
@@ -643,8 +969,7 @@ private:
         }
 #if defined(_INC_WINDOWS) || defined(_WINDOWS_)
         {
-            static bool initialized = false;
-            static bool vt_enabled = false;
+            static bool initialized = false, vt_enabled = false;
             if (!initialized)
             {
                 initialized = true;
@@ -664,8 +989,8 @@ private:
         }
 #endif
         {
-            const char *wt = std::getenv("WT_SESSION");
-            const char *term = std::getenv("TERM");
+            const char* wt = std::getenv("WT_SESSION");
+            const char* term = std::getenv("TERM");
             cached = (wt != nullptr) || (term != nullptr);
             return cached;
         }
@@ -675,7 +1000,7 @@ private:
 #endif
     }
 
-    void writeToScreen_(const std::string &s, bool isNewLine, Level lv)
+    void writeToScreen_(const std::string& s, bool isNewLine, Level lv)
     {
         const bool colorize = _log_screen_color && supportsAnsiColor_();
         if (colorize)
@@ -715,7 +1040,7 @@ private:
         }
         std::ostringstream fn;
         fn << _baseFullNameWithDateAndTime << '_' << _currentRollIndex << ".log";
-        _file.open(fn.str(), std::ofstream::out | (_isRoll ? std::ofstream::trunc : std::ofstream::app) | std::ofstream::binary);
+        _file.open(fn.str(), std::ios::out | (_isRoll ? std::ios::trunc : std::ios::app) | std::ios::binary);
         if (!_file.is_open())
         {
             reportError_(std::string("Failed to open new log file: ") + fn.str());
@@ -724,7 +1049,7 @@ private:
         }
         _file.seekp(0, std::ios::end);
         std::streampos pos = _file.tellp();
-        _currentSize = (pos >= 0) ? static_cast<size_t>(pos) : 0u;
+        _currentSize = (pos >= 0) ? (size_t)pos : 0u;
     }
 
     /* ========== 时间/颜色帮助 ========== */
@@ -746,7 +1071,7 @@ private:
         return std::string(buf);
     }
 
-    const char *levelColorAnsi_(Level lv) const
+    const char* levelColorAnsi_(Level lv) const
     {
         switch (lv)
         {
@@ -770,7 +1095,7 @@ private:
     }
 
     /* ========== 错误报告 ========== */
-    void reportError_(const std::string &m)
+    void reportError_(const std::string& m)
     {
         if (in_logging_flag_())
         {
@@ -795,7 +1120,7 @@ private:
     }
 
     /* ========== 平台封装 ========== */
-    static bool platform_createDirectories_(const std::string &path)
+    static bool platform_createDirectories_(const std::string& path)
     {
         std::string p = path;
         std::replace(p.begin(), p.end(), '\\', '/');
@@ -834,9 +1159,9 @@ private:
 
     static std::string platform_getModulePath_()
     {
-        char buf[1024] = {0};
+        char buf[1024] = { 0 };
 #if defined(_WIN32)
-        char *exe = nullptr;
+        char* exe = nullptr;
         if (_get_pgmptr(&exe) == 0 && exe)
         {
             std::string p(exe);
@@ -848,7 +1173,7 @@ private:
         return ".";
 #else
         Dl_info info{};
-        if (dladdr((void *)(&platform_getModulePath_), &info) && info.dli_fname)
+        if (dladdr((void*)(&platform_getModulePath_), &info) && info.dli_fname)
         {
             std::string p(info.dli_fname);
             size_t pos = p.find_last_of('/');
@@ -862,9 +1187,9 @@ private:
 
     static std::string platform_getProcessName_()
     {
-        char buf[1024] = {0};
+        char buf[1024] = { 0 };
 #if defined(_WIN32)
-        char *exe = nullptr;
+        char* exe = nullptr;
         if (_get_pgmptr(&exe) == 0 && exe)
         {
             std::string n(exe);
@@ -892,7 +1217,7 @@ private:
 
     static std::string platform_currentDirWithSlash_()
     {
-        char buf[1024] = {0};
+        char buf[1024] = { 0 };
 #if defined(_WIN32)
         if (_getcwd(buf, sizeof(buf)) != nullptr)
             return std::string(buf) + "\\";
@@ -903,7 +1228,7 @@ private:
         return std::string();
     }
 
-    static std::vector<std::string> platform_listLogFiles_(const std::string &dir, const std::string &stem)
+    static std::vector<std::string> platform_listLogFiles_(const std::string& dir, const std::string& stem)
     {
         std::vector<std::string> out;
 #if defined(_WIN32)
@@ -927,9 +1252,9 @@ private:
             _findclose(h);
         }
 #else
-        if (DIR *d = opendir(dir.c_str()))
+        if (DIR* d = opendir(dir.c_str()))
         {
-            while (dirent *e = readdir(d))
+            while (dirent* e = readdir(d))
             {
                 if (e->d_type == DT_REG)
                 {
@@ -945,7 +1270,7 @@ private:
         return out;
     }
 
-    static void platform_deleteFile_(const std::string &full)
+    static void platform_deleteFile_(const std::string& full)
     {
         if (std::remove(full.c_str()) != 0)
         {
@@ -958,7 +1283,7 @@ private:
     }
 
     /* ========== 旧文件日期解析/保留策略 ========== */
-    bool shouldDeleteLog_(const std::string &filename, int days) const
+    bool shouldDeleteLog_(const std::string& filename, int days) const
     {
         const std::time_t ft = parseDateFromFilename_(filename);
         if (ft == (time_t)-1)
@@ -967,7 +1292,7 @@ private:
         return std::difftime(now, ft) > double(days) * 24.0 * 3600.0;
     }
 
-    std::time_t parseDateFromFilename_(const std::string &filename) const
+    std::time_t parseDateFromFilename_(const std::string& filename) const
     {
         if (filename.rfind(_baseNameWithoutPath + "_", 0) != 0)
             return (time_t)-1;
@@ -997,7 +1322,7 @@ private:
 
 private:
     // 文件/锁
-    std::ofstream _file;
+    ML_FastOFStream _file;
     std::mutex _mutex;
 
     // 配置
@@ -1035,53 +1360,183 @@ private:
     ErrorHandler _error_handler;
 
     // 递归/自锁防护（线程局部，兼容 C++14）
-    static bool &in_logging_flag_()
+    static bool& in_logging_flag_()
     {
         thread_local bool flag = false;
         return flag;
     }
 };
 
-/* ========================= 日志流（宏兼容） ========================= */
+/* ========================= 日志流（无 stringstream 轻量路径） ========================= */
 class LoggerStream
 {
 public:
-    LoggerStream(ML_Logger::Level lv, const char *file, int line) : _lv(lv), _file(file), _line(line) {}
-    template <typename T>
-    LoggerStream &operator<<(const T &v)
+    LoggerStream(ML_Logger::Level lv, const char* file, int line)
+        : _lv(lv), _file(file), _line(line)
     {
-        _ss << v;
+        if (_buf.capacity() < 256)
+            _buf.reserve(256);
+        _buf.clear();
+    }
+    LoggerStream& operator<<(const std::string& s)
+    {
+        _buf.append(s);
         return *this;
     }
-    template <typename T>
-    LoggerStream &operator<<(T *p)
-    {
-        if (p)
-            _ss << static_cast<const void *>(p);
-        else
-            _ss << "nullptr";
-        return *this;
-    }
-    LoggerStream &operator<<(const char *s)
+    LoggerStream& operator<<(const char* s)
     {
         if (s)
-            _ss << s;
+            _buf.append(s);
         else
-            _ss << "nullptr";
+            _buf.append("nullptr");
         return *this;
     }
-    ~LoggerStream() { ML_Logger::getInstance().log(_file, _line, _lv, _ss.str(), ML_Logger::getInstance().getAddNewLine()); }
+    LoggerStream& operator<<(char c)
+    {
+        _buf.push_back(c);
+        return *this;
+    }
+    template <class T>
+    LoggerStream& operator<<(T* p)
+    {
+        if (!p)
+        {
+            _buf.append("nullptr");
+            return *this;
+        }
+        char tmp[32];
+#if defined(_WIN32)
+        int n = _snprintf(tmp, sizeof(tmp), "%p", (const void*)p);
+#else
+        int n = std::snprintf(tmp, sizeof(tmp), "%p", (const void*)p);
+#endif
+        if (n > 0)
+            _buf.append(tmp, (size_t)n);
+        return *this;
+    }
+    LoggerStream& operator<<(bool v)
+    {
+        _buf.push_back(v ? '1' : '0');
+        return *this;
+    }
+    LoggerStream& operator<<(short v)
+    {
+        append_int((long long)v);
+        return *this;
+    }
+    LoggerStream& operator<<(unsigned short v)
+    {
+        append_uint((unsigned long long)v);
+        return *this;
+    }
+    LoggerStream& operator<<(int v)
+    {
+        append_int((long long)v);
+        return *this;
+    }
+    LoggerStream& operator<<(unsigned int v)
+    {
+        append_uint((unsigned long long)v);
+        return *this;
+    }
+    LoggerStream& operator<<(long v)
+    {
+        append_int((long long)v);
+        return *this;
+    }
+    LoggerStream& operator<<(unsigned long v)
+    {
+        append_uint((unsigned long long)v);
+        return *this;
+    }
+    LoggerStream& operator<<(long long v)
+    {
+        append_int(v);
+        return *this;
+    }
+    LoggerStream& operator<<(unsigned long long v)
+    {
+        append_uint(v);
+        return *this;
+    }
+    LoggerStream& operator<<(float v)
+    {
+        append_float((double)v);
+        return *this;
+    }
+    LoggerStream& operator<<(double v)
+    {
+        append_float(v);
+        return *this;
+    }
+    LoggerStream& operator<<(long double v)
+    {
+        append_float((double)v);
+        return *this;
+    }
+
+    template <class T>
+    LoggerStream& operator<<(const T& v)
+    {
+        // 罕见路径：fallback 一次 ostringstream
+        std::ostringstream oss;
+        oss << v;
+        _buf.append(oss.str());
+        return *this;
+    }
+
+    ~LoggerStream()
+    {
+        ML_Logger::getInstance().log(_file, _line, _lv, _buf, ML_Logger::getInstance().getAddNewLine());
+    }
+
+private:
+    static inline void append_int_to(std::string& out, long long v)
+    {
+        char tmp[32];
+#if defined(_WIN32)
+        int n = _snprintf(tmp, sizeof(tmp), "%lld", v);
+#else
+        int n = std::snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
+#endif
+        if (n > 0)
+            out.append(tmp, (size_t)n);
+    }
+    static inline void append_uint_to(std::string& out, unsigned long long v)
+    {
+        char tmp[32];
+#if defined(_WIN32)
+        int n = _snprintf(tmp, sizeof(tmp), "%llu", v);
+#else
+        int n = std::snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)v);
+#endif
+        if (n > 0)
+            out.append(tmp, (size_t)n);
+    }
+    static inline void append_float_to(std::string& out, double v)
+    {
+        char tmp[64];
+#if defined(_WIN32)
+        int n = _snprintf(tmp, sizeof(tmp), "%.6g", v);
+#else
+        int n = std::snprintf(tmp, sizeof(tmp), "%.6g", v);
+#endif
+        if (n > 0)
+            out.append(tmp, (size_t)n);
+    }
+    inline void append_int(long long v) { append_int_to(_buf, v); }
+    inline void append_uint(unsigned long long v) { append_uint_to(_buf, v); }
+    inline void append_float(double v) { append_float_to(_buf, v); }
 
 private:
     ML_Logger::Level _lv;
-    const char *_file;
+    const char* _file;
     int _line;
-    std::stringstream _ss;
+    std::string _buf;
 };
 
 /* ========================= 宏接口（兼容） ========================= */
 #define MLSHORT_FILE mllog_file_name_from_path(__FILE__)
-
 #define MLLOG(level) LoggerStream(level, MLSHORT_FILE, __LINE__)
 
 #define MLLOGF(level, fmt, ...)                                                                \
