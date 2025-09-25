@@ -9,6 +9,8 @@
  *      - GitHub: https://github.com/mixml
  *
  * 变更摘要（关键）：
+ * @version 2.9.2
+ *      - 修复Windows下, 在C: D:盘根目录无法创建log文件夹的bug.
  * @version 2.9.1
  *      - Linux下增加自愈功能. Linux 自愈同时覆盖 unlink 与 rename+create；copytruncate 不重开（符合常见策略）。
  * @version 2.9.0
@@ -318,9 +320,9 @@
 #endif
 
 /* ========================= 命名空间：当前版本 ========================= */
-namespace mllog_v291
+namespace mllog_v292
 {
-    inline namespace v2_9_1
+    inline namespace v2_9_2
     {
         /* ---------- constexpr 工具 ---------- */
         constexpr const char* mllog_find_last_slash_helper(const char* s, const char* last)
@@ -859,7 +861,7 @@ namespace mllog_v291
                     else
                         break;
                 }
-                bool needNewLine = isNewLine;
+                bool needNewLine = isNewLine && (end == msg.size()); // 仅当原文末尾本就没有换行时才补
                 // -------------------------------------------------------------------
                 // Light 阶段：上屏 + 入 pending
                 if (phase() != Phase::Full)
@@ -880,7 +882,7 @@ namespace mllog_v291
                                 int plen = buildPrefix_(prefix, sizeof(prefix), lv, file_short, line, time_c, ms_count);
                                 if (plen > 0)
                                     linebuf.append(prefix, (size_t)plen);
-                                linebuf.append(msg);
+                                linebuf.append(msg.data(), end);
                             }
                         }
                         else
@@ -889,14 +891,14 @@ namespace mllog_v291
                             int plen = buildPrefix_(prefix, sizeof(prefix), lv, file_short, line, time_c, ms_count);
                             if (plen > 0)
                                 linebuf.append(prefix, (size_t)plen);
-                            linebuf.append(msg);
+                            linebuf.append(msg.data(), end);
                         }
                     }
                     else
                     {
-                        linebuf.append(msg);
+                        linebuf.append(msg.data(), end);
                     }
-                    if (isNewLine)
+                    if (needNewLine)
                         linebuf.push_back('\n');
 
                     {
@@ -940,7 +942,7 @@ namespace mllog_v291
                 {
                     formatMessageFast_DefaultPrefix_(lv, file_short, line, time_c, ms_count, msg, formatted);
                 }
-                writeToTargets_(formatted, isNewLine, lv);
+                writeToTargets_(formatted, needNewLine, lv);
             }
 
             void logformat(const char* file_short, const char* file_full, const char* func, int line,
@@ -1495,39 +1497,85 @@ namespace mllog_v291
 
             static bool platform_createDirectories_(const std::string& path)
             {
-                std::string p = path;
-                std::replace(p.begin(), p.end(), '\\', '/');
-                if (p.empty())
+#if defined(_WIN32)
+                if (path.empty())
                     return true;
-                std::string cur = (p[0] == '/') ? std::string("/") : std::string();
-                std::stringstream ss(p);
+
+                std::string p = path;
+                std::replace(p.begin(), p.end(), '/', '\\');
+
+                std::string cur;
+                size_t i = 0;
+
+                // UNC: \\server\share\...
+                if (p.size() >= 2 && p[0] == '\\' && p[1] == '\\')
+                {
+                    size_t j = p.find('\\', 2);
+                    if (j == std::string::npos)
+                        return false; // \\server
+                    size_t k = p.find('\\', j + 1);
+                    if (k == std::string::npos)
+                        return false;     // \\server\share (缺少后续分隔)
+                    cur = p.substr(0, k); // \\server\share
+                    i = k + 1;            // 跳过 '\'
+                    // UNC 根不 mkdir
+                }
+                // 盘符: X:\...
+                else if (p.size() >= 2 && std::isalpha((unsigned char)p[0]) && p[1] == ':')
+                {
+                    cur = p.substr(0, 2); // "X:"
+                    i = 2;
+                    if (i < p.size() && p[i] == '\\')
+                    {
+                        cur += '\\';
+                        ++i;
+                    } // "X:\"
+                    // 不对 "X:" / "X:\" 调 mkdir
+                }
+
+                // 逐段创建
+                while (i < p.size())
+                {
+                    while (i < p.size() && p[i] == '\\')
+                        ++i;
+                    if (i >= p.size())
+                        break;
+                    size_t j = p.find('\\', i);
+                    std::string seg = (j == std::string::npos) ? p.substr(i) : p.substr(i, j - i);
+                    i = (j == std::string::npos) ? p.size() : j + 1;
+
+                    if (seg.empty() || seg == ".")
+                        continue;
+
+                    if (!cur.empty() && cur.back() != '\\')
+                        cur.push_back('\\');
+                    cur += seg;
+
+                    if (_mkdir(cur.c_str()) != 0 && errno != EEXIST)
+                        return false;
+                }
+                return true;
+#else
+                // 你的原 *nix 实现就行
+                std::string q = path;
+                std::replace(q.begin(), q.end(), '\\', '/');
+                if (q.empty())
+                    return true;
+                std::string cur = (q[0] == '/') ? std::string("/") : std::string();
+                std::stringstream ss(q);
                 std::string seg;
                 while (std::getline(ss, seg, '/'))
                 {
                     if (seg.empty() || seg == ".")
                         continue;
-#if defined(_WIN32)
-                    if (cur.empty() && seg.find(':') != std::string::npos)
-                    {
-                        cur += seg;
-                    }
-                    else
-                    {
-                        if (!cur.empty() && cur.back() != '/')
-                            cur.push_back('/');
-                        cur += seg;
-                    }
-                    if (_mkdir(cur.c_str()) != 0 && errno != EEXIST)
-                        return false;
-#else
                     if (!cur.empty() && cur.back() != '/')
                         cur.push_back('/');
                     cur += seg;
                     if (::mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST)
                         return false;
-#endif
                 }
                 return true;
+#endif
             }
 
             static std::string platform_getModulePath_()
@@ -2317,8 +2365,8 @@ namespace mllog_v291
             int _line;
             std::string _buf;
         };
-    } // inline namespace v2_9_1
-} // namespace mllog_v291
+    } // inline namespace v2_9_2
+} // namespace mllog_v292
 
 #if !defined(_WIN32)
 #pragma GCC visibility pop
@@ -2326,7 +2374,7 @@ namespace mllog_v291
 
 /* ========================= 版本选择宏（全局定义） ========================= */
 #ifndef ML_NS
-#define ML_NS ::mllog_v291::v2_9_1
+#define ML_NS ::mllog_v292::v2_9_2
 #endif
 
 /* ========================= 宏接口 ========================= */
