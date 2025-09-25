@@ -3,11 +3,24 @@
 
 /**
  * @file mllog.hpp
- * @brief 多功能、跨平台、单头文件日志系统（Turbo, Anywhere-Safe Start）
+ * @brief 多功能、跨平台、单头文件日志系统（Turbo, Anywhere-Safe Start, Pattern）
  * @author malin
  *      - Email: zcyxml@163.com  mlin2@grgbanking.com
  *      - GitHub: https://github.com/mixml
+ *
  * 变更摘要（关键）：
+ * @version 2.9.1
+ *      - Linux下增加自愈功能. Linux 自愈同时覆盖 unlink 与 rename+create；copytruncate 不重开（符合常见策略）。
+ * @version 2.9.0
+ *      - 增加setPattern
+ *       时间： %Y %m %d %H %M %S（strftime 语法） %e → 毫秒（000–999）
+ *       级别/元信息/源码：%l 短级别（DEBUG/INFO/…）, %L （大写，等价于 %l）, %n logger 名（即 Registry 的 name）, %P 进程 id, %t 线程 id（hash 后的无符号数）, %s 文件名（当前宏里是短文件名）,%# 行号
+ *       内容： %v 日志正文, 颜色标记 %^ / %$ （先占位，当前实现忽略；仍沿用你已有的整行按级别上色策略）
+ *       例："%Y-%m-%d %H:%M:%S.%e [%l] %n %s:%# | %v"
+ * @version 2.8.3 (2025-09-23 Default-per-DSO + Console polish)
+ *      - 默认日志前缀改为：<模块目录>/log/<模块名>_MLLOG（不同 DSO 默认不冲突）
+ *      - Windows 颜色：使用 STD_OUTPUT_HANDLE；仅在 isatty 且成功启用 VT 时上色（去除环境变量兜底）
+ *      - 清理：移除未用成员；rollFiles_() 统一无参
  * @version 2.8.2 (2025-09-23 Linux增加hidden)
  * @version 2.8.1 (2025-09-23 增加版本命名空间与 ML_NS 宏)
  * @version 2.8.0 (2025-09-23 Multi-Instance + Anywhere-Safe Polishing)
@@ -95,9 +108,7 @@
  *      - 增加两个宏MLLOG_MESSAGE_ONLY,MLLOG_ADD_NEWLINE
  * @version 1.0 (2024年4月16日)
  *      - 初始版本。
- * @section usage 使用示例 (Usage)
- *
- * @subsection basic_usage 基础用法（默认实例）
+ * @subsection basic_usage 基础用法（默认实例 + Pattern）
  * @code
  * #include "mllog.hpp"
  * #include <vector>
@@ -115,7 +126,11 @@
  *     logger.setOutput(true, true);              // 文件 + 控制台
  *     logger.setScreenColor(true);               // 控制台颜色（多线程已串行化输出）
  *
- *     // 3) 在安全时机转正到 Full（开始正常落盘）
+ *     // 可选：自定义 Pattern（含毫秒/级别/logger名/短文件/行/函数/正文）
+ *     // 说明：%e=毫秒，%l 级别，%n 实例名，%s 短文件，%g 全路径文件，%# 行号，%! 函数名，%v 正文
+ *     logger.setPattern("%Y-%m-%d %H:%M:%S.%e [%l] %n %s:%# %! | %v");
+ *
+ *     // 3) 在安全时机转正到 Full（开始正常落盘，自动回放 Light 期间的 pending）
  *     MLLOG_PROMOTE_TO_FULL();
  *
  *     // 4) 流式日志
@@ -129,23 +144,28 @@
  *     MLLOG_ERRORF("处理失败，错误码: %d, 错误信息: %s", 1001, "文件未找到");
  *     MLLOG_CRITICALF("系统关键组件 '%s' 无响应!", "DatabaseConnector");
  *
- *     // 6) 结束前可记录 Stop 行，并手动刷盘
+ *     // 6) 可随时回退到默认前缀（清空 pattern 即可）
+ *     logger.setPattern("");
+ *     MLLOG_INFO << "已回退到默认前缀格式。";
+ *
+ *     // 7) 结束前可记录 Stop 行，并手动刷盘
  *     MLLOG_ALERT << "---------- Stop MLLOG ----------";
  *     logger.flush();
  *     return 0;
  * }
  * @endcode
  *
- * @subsection advanced_usage 进阶配置（性能/跨天/清理）
+ * @subsection advanced_usage 进阶配置（性能/跨天/清理/滚动/并发稳定）
  * @code
  * #include "mllog.hpp"
  * #include <iostream>
+ * using namespace ML_NS;
  *
  * // 自定义库内部错误处理器（可用于上报）
  * static void on_log_internal_error(const std::string& msg) {
  *     std::cerr << "!!! MLLOG INTERNAL: " << msg << std::endl;
  * }
- * using namespace ML_NS;
+ *
  * int main() {
  *     auto& L = ML_Logger::get();
  *
@@ -156,18 +176,22 @@
  *     MLLOG_START();
  *
  *     // 3) 高级配置
- *     L.setLogFile("./logs/perf_test");
+ *     L.setLogFile("./logs/perf_test/perf", 5,  64 * 1024 * 1024);
  *     L.setLevel(ML_Logger::Level::Info);
  *     L.setAutoFlush(false);   // 高频写建议关闭自动刷盘
  *     L.setCheckDay(true);     // 跨天自动切换新日志
  *     L.setOutput(true, true); // 文件 + 控制台
+ *     L.setPattern("%Y-%m-%d %H:%M:%S.%e [%l] %n %g:%# %! | %v"); // 用全路径文件名
  *
  *     // 4) 转正（Full）
  *     MLLOG_PROMOTE_TO_FULL();
  *
- *     // 5) 高频写测试
+ *     // 5) 高频写测试（流式 + printf）
  *     for (int i = 0; i < 1000; ++i) {
  *         MLLOG_INFO << "Processing item " << i;
+ *         if ((i % 200) == 0) {
+ *             MLLOG_WARNINGF("milestone i=%d", i);
+ *         }
  *     }
  *
  *     // 6) 手动刷盘与清理
@@ -179,7 +203,7 @@
  * }
  * @endcode
  *
- * @subsection named_usage 命名实例用法（每个 SO/子系统独立日志）
+ * @subsection named_usage 命名实例用法（每个 SO/子系统独立日志 + Pattern）
  * @code
  * #include "mllog.hpp"
  * using namespace ML_NS;
@@ -196,6 +220,7 @@
  *     LV.setLogFile("./logs/vision/vision", 7, 50 * 1024 * 1024);
  *     LV.setOutput(true, true);
  *     LV.setScreenColor(true);
+ *     LV.setPattern("%Y-%m-%d %H:%M:%S.%e [%l] %n %s:%# %! | %v"); // 短文件 + 行 + 函数
  *
  *     // 3) 安全时机转正
  *     MLLOG_PROMOTE_TO_FULL_NAMED(VISION_LOG);
@@ -204,7 +229,13 @@
  *     MLLOG_INFO_NAMED(VISION_LOG) << "vision subsystem ready";
  *     MLLOG_WARNINGF_NAMED(VISION_LOG, "fps 低: %.2f", 23.7);
  *
- *     // 5) 需要时手动刷盘
+ *     // 5) 任意时机切换 Pattern 或回退默认前缀
+ *     LV.setPattern("%Y-%m-%d %H:%M:%S.%e [%l] %n %g:%# %! | %v"); // 改用全路径文件
+ *     MLLOG_INFO_NAMED(VISION_LOG) << "pattern switched.";
+ *     LV.setPattern(""); // 清空 => 用默认前缀
+ *     MLLOG_INFO_NAMED(VISION_LOG) << "back to default prefix.";
+ *
+ *     // 6) 需要时手动刷盘
  *     MLLOG_FORCE_FLUSH_NAMED(VISION_LOG);
  * }
  * @endcode
@@ -231,6 +262,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread> // [NEW] 线程id散列
 #include <vector>
 
 #if defined(_WIN32)
@@ -241,9 +273,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <direct.h>
-#include <fcntl.h> // _O_*
+#include <fcntl.h>
 #include <io.h>
-#include <share.h> // _sopen_s
+#include <share.h>
 #include <sys/stat.h>
 #include <windows.h>
 #pragma warning(disable : 4996)
@@ -255,7 +287,7 @@
 #include <unistd.h>
 #endif
 
-/* ========================= ANSI 颜色（保持全局宏，不产生命名冲突） ========================= */
+/* ========================= ANSI 颜色 ========================= */
 #define MLLOG_COLOR_NORMAL "\x1B[0m"
 #define MLLOG_COLOR_RED "\x1B[31m"
 #define MLLOG_COLOR_GREEN "\x1B[32m"
@@ -280,17 +312,17 @@
 #endif
 #endif
 
+/* Linux/Clang/GCC：默认隐藏符号（避免跨 DSO 符号冲突）；MSVC 无影响 */
 #if !defined(_WIN32)
 #pragma GCC visibility push(hidden)
 #endif
 
 /* ========================= 命名空间：当前版本 ========================= */
-namespace mllog_v282
+namespace mllog_v291
 {
-    inline namespace v2_8_2
+    inline namespace v2_9_1
     {
-
-        /* ========================= constexpr 工具（移入命名空间） ========================= */
+        /* ---------- constexpr 工具 ---------- */
         constexpr const char* mllog_find_last_slash_helper(const char* s, const char* last)
         {
             return (*s == '\0') ? (last ? last : s)
@@ -319,10 +351,34 @@ namespace mllog_v282
 #endif
 #endif
 
+#ifndef ML_DEPRECATED
+#if defined(__has_cpp_attribute)
+#if __has_cpp_attribute(deprecated)
+#define ML_DEPRECATED(msg) [[deprecated(msg)]]
+#else
+#if defined(_MSC_VER)
+#define ML_DEPRECATED(msg) __declspec(deprecated(msg))
+#elif defined(__GNUC__) || defined(__clang__)
+#define ML_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#else
+#define ML_DEPRECATED(msg)
+#endif
+#endif
+#else
+#if defined(_MSC_VER)
+#define ML_DEPRECATED(msg) __declspec(deprecated(msg))
+#elif defined(__GNUC__) || defined(__clang__)
+#define ML_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#else
+#define ML_DEPRECATED(msg)
+#endif
+#endif
+#endif
+
         template <class T>
         ML_NODISCARD ML_ALWAYS_INLINE constexpr const T& ml_max(const T& a, const T& b) noexcept { return (a < b) ? b : a; }
 
-        /* ============= 轻量 ofstream 替代（Win: _open/_write + 1MB；Nix: FILE* + 1MB） ============= */
+        /* ============= 轻量 ofstream 替代（略同你现有实现） ============= */
         class ML_FastOFStream
         {
         public:
@@ -338,8 +394,6 @@ namespace mllog_v282
 
             ML_FastOFStream(const ML_FastOFStream&) = delete;
             ML_FastOFStream& operator=(const ML_FastOFStream&) = delete;
-            ML_FastOFStream(ML_FastOFStream&&) = delete;
-            ML_FastOFStream& operator=(ML_FastOFStream&&) = delete;
 
             void open(const std::string& path, std::ios::openmode mode)
             {
@@ -538,7 +592,9 @@ namespace mllog_v282
 
             bool bad() const { return failed_; }
             void clear_bad() { failed_ = false; }
-
+#ifndef _WIN32
+            int native_fileno() const { return fp_ ? ::fileno(fp_) : -1; }
+#endif
         private:
 #if defined(_WIN32)
             void flush_buffer_()
@@ -573,9 +629,9 @@ namespace mllog_v282
         class ML_LoggerRegistry
         {
         public:
-            static ML_LoggerRegistry& getInstance(); // 永不析构
-            ML_Logger& get(const std::string& name); // 定义在 ML_Logger 定义之后
-            ~ML_LoggerRegistry();                    // 不会被调用（永不析构）
+            static ML_LoggerRegistry& getInstance();
+            ML_Logger& get(const std::string& name);
+            ~ML_LoggerRegistry();
 
         private:
             ML_LoggerRegistry() = default;
@@ -604,22 +660,21 @@ namespace mllog_v282
 
             static const size_t MAX_LOG_MESSAGE_SIZE = 1024u * 1024u * 5u;
             static constexpr const char* TRUNCATED_MESSAGE = "\n... [Message Truncated]";
-
             enum class Phase : int
             {
                 Off = 0,
                 Light = 1,
                 Full = 2
             };
-
             static ML_Logger& get(const std::string& name = "default")
             {
                 return ML_LoggerRegistry::getInstance().get(name);
             }
             static ML_Logger& getInstance() { return get("default"); }
-
-            ML_Logger()
-                : _isRoll(false), _logLevel(Level::Debug),
+            // [CHG]：带 name 的构造；Registry 会传入
+            ML_Logger(const std::string& name = "default")
+                : _name(name),
+                  _isRoll(false), _logLevel(Level::Debug),
                   _outputToFile(true), _outputToScreen(true),
                   _currentRollIndex(0), _maxRolls(5),
                   _maxSizeInBytes(100u * 1024u * 1024u), _currentSize(0),
@@ -627,10 +682,11 @@ namespace mllog_v282
                   _log_enabled(false), _log_screen_color(true),
                   _default_file_name_day(true), _isCheckDay(false),
                   _start_timestamp(), _last_log_ymd(0), _auto_flush(true),
-                  _cached_time_sec(0), _need_day_switch(false), _error_handler(nullptr),
-                  _phase((int)Phase::Off), _pending_bytes(0)
+                  _need_day_switch(false), _error_handler(nullptr),
+                  _pending_bytes(0), _phase((int)Phase::Off),
+                  _has_pattern(false)
             {
-                std::string def = get_module_path() + "/log/" + get_process_name() + "_MLLOG";
+                std::string def = get_module_path() + "/log/" + platform_getModuleBasename_() + "_MLLOG";
                 setLogFile(def, _maxRolls, _maxSizeInBytes);
             }
 
@@ -655,8 +711,6 @@ namespace mllog_v282
 
             ML_Logger(const ML_Logger&) = delete;
             ML_Logger& operator=(const ML_Logger&) = delete;
-            ML_Logger(ML_Logger&&) = delete;
-            ML_Logger& operator=(ML_Logger&&) = delete;
 
             /* 配置接口 */
             void setLevel(Level lv) { _logLevel = lv; }
@@ -673,6 +727,7 @@ namespace mllog_v282
             void setScreenColor(bool on) { _log_screen_color = on; }
             void setAutoFlush(bool enabled) { _auto_flush = enabled; }
             void setErrorHandler(ErrorHandler h) { _error_handler = std::move(h); }
+
             void setLogSwitch(bool on)
             {
                 _log_enabled = on;
@@ -681,18 +736,7 @@ namespace mllog_v282
             }
             bool getLogSwitch() const { return _log_enabled; }
 
-            ML_Logger::Level LevelFromInt_Clamped(int v)
-            {
-                using UT = std::underlying_type<ML_Logger::Level>::type;
-                UT lo = static_cast<UT>(ML_Logger::Level::Debug);
-                UT hi = static_cast<UT>(ML_Logger::Level::Alert);
-                if (v < static_cast<int>(lo))
-                    v = static_cast<int>(lo);
-                if (v > static_cast<int>(hi))
-                    v = static_cast<int>(hi);
-                return static_cast<ML_Logger::Level>(static_cast<UT>(v));
-            }
-
+            // ---------- Anywhere-Safe 启停 ----------
             void startAnywhere(bool emit_banner = true)
             {
                 std::lock_guard<std::mutex> lk(_mutex);
@@ -724,12 +768,12 @@ namespace mllog_v282
 
                 if (!_initialized)
                 {
-                    rollFiles_(true);
+                    rollFiles_();
                     _initialized = true;
                 }
                 else if (!_file.is_open())
                 {
-                    rollFiles_(true);
+                    rollFiles_();
                 }
 
                 if (!_file.is_open())
@@ -751,7 +795,7 @@ namespace mllog_v282
                         reportError_("promoteToFull(): flush pending failed; keeping pending.");
                         _file.close();
                         _initialized = false;
-                        return; // 不转 Full
+                        return;
                     }
                     _currentSize += sz;
                     if (_currentSize >= _maxSizeInBytes)
@@ -781,6 +825,8 @@ namespace mllog_v282
                 _baseFullNameWithDateAndTime = _baseName + "_" + _start_timestamp;
                 if (_file.is_open())
                     _file.close();
+                _curFilePath.clear();
+                _heal_counter = 0;
             }
 
             void flush()
@@ -790,7 +836,9 @@ namespace mllog_v282
                     _file.flush();
             }
 
-            void log(const char* file, int line, Level lv, const std::string& original, bool isNewLine = true)
+            // [CHG]：log / logformat 现在额外携带 fullpath 与 func；pattern 可用 %g / %!
+            void log(const char* file_short, const char* file_full, const char* func, int line,
+                     Level lv, const std::string& original, bool isNewLine = true)
             {
                 if (!_log_enabled || lv < _logLevel)
                     return;
@@ -799,24 +847,55 @@ namespace mllog_v282
                 std::tm cached_tm{};
                 const char* time_c = nullptr;
                 updateAndGetTimeCache_(cached_tm, ms_count, time_c);
+
                 const std::string msg = maybeTruncate_(original);
-
-                char prefix[192];
-                int plen = 0;
-                if (!_message_only)
+                // 计算有效结尾（零分配）
+                size_t end = msg.size();
+                while (end > 0)
                 {
-                    plen = buildPrefix_(prefix, sizeof(prefix), lv, file, line, time_c, ms_count);
-                    if (plen < 0)
-                        plen = 0;
+                    char c = msg[end - 1];
+                    if (c == '\n' || c == '\r')
+                        --end;
+                    else
+                        break;
                 }
-
-                Phase ph = phase();
-                if (ph != Phase::Full)
+                bool needNewLine = isNewLine;
+                // -------------------------------------------------------------------
+                // Light 阶段：上屏 + 入 pending
+                if (phase() != Phase::Full)
                 {
                     std::string linebuf;
-                    if (!_message_only && plen > 0)
-                        linebuf.append(prefix, (size_t)plen);
-                    linebuf.append(msg);
+                    if (!_message_only)
+                    {
+                        if (_has_pattern.load(std::memory_order_acquire))
+                        {
+                            std::lock_guard<std::mutex> lk(_mutex); // 复用已有互斥量
+                            if (_has_pattern.load(std::memory_order_relaxed) && !_pat_ops.empty())
+                            {
+                                renderPattern_(cached_tm, ms_count, lv, file_short, file_full, func, line, msg, linebuf);
+                            }
+                            else
+                            {
+                                char prefix[192];
+                                int plen = buildPrefix_(prefix, sizeof(prefix), lv, file_short, line, time_c, ms_count);
+                                if (plen > 0)
+                                    linebuf.append(prefix, (size_t)plen);
+                                linebuf.append(msg);
+                            }
+                        }
+                        else
+                        {
+                            char prefix[192];
+                            int plen = buildPrefix_(prefix, sizeof(prefix), lv, file_short, line, time_c, ms_count);
+                            if (plen > 0)
+                                linebuf.append(prefix, (size_t)plen);
+                            linebuf.append(msg);
+                        }
+                    }
+                    else
+                    {
+                        linebuf.append(msg);
+                    }
                     if (isNewLine)
                         linebuf.push_back('\n');
 
@@ -839,21 +918,33 @@ namespace mllog_v282
                     return;
                 }
 
-                if (_outputToFile && !_outputToScreen && !_message_only)
+                // Full 阶段
+                auto& formatted = tls_buf_();
+                if (_message_only)
                 {
-                    if (plen > 0)
+                    formatted.assign(msg);
+                }
+                else if (_has_pattern.load(std::memory_order_acquire))
+                {
+                    std::lock_guard<std::mutex> lk(_mutex); // 防止与 setPattern() 并发
+                    if (_has_pattern.load(std::memory_order_relaxed) && !_pat_ops.empty())
                     {
-                        writeToTargetsFileOnly_(prefix, (size_t)plen, msg, isNewLine, lv);
-                        return;
+                        renderPattern_(cached_tm, ms_count, lv, file_short, file_full, func, line, msg, formatted);
+                    }
+                    else
+                    {
+                        formatMessageFast_DefaultPrefix_(lv, file_short, line, time_c, ms_count, msg, formatted);
                     }
                 }
-
-                auto& formatted = tls_buf_();
-                formatMessageFast_(lv, file, line, time_c, ms_count, msg, formatted);
+                else
+                {
+                    formatMessageFast_DefaultPrefix_(lv, file_short, line, time_c, ms_count, msg, formatted);
+                }
                 writeToTargets_(formatted, isNewLine, lv);
             }
 
-            void logformat(const char* file, int line, Level lv, const char* fmt, ...)
+            void logformat(const char* file_short, const char* file_full, const char* func, int line,
+                           Level lv, const char* fmt, ...)
             {
                 if (!_log_enabled || lv < _logLevel)
                     return;
@@ -885,12 +976,17 @@ namespace mllog_v282
                     break;
                 }
                 va_end(args);
-                log(file, line, lv, s, _add_newline);
+                log(file_short, file_full, func, line, lv, s, _add_newline);
             }
 
+            // 工具：路径/进程名
             static std::string get_module_path() { return platform_getModulePath_(); }
-            std::string get_process_name() const { return platform_getProcessName_(); }
+            static std::string get_module_basename() { return platform_getModuleBasename_(); }
+            static std::string process_name() { return platform_getProcessName_(); }
+            ML_DEPRECATED("Use ML_Logger::process_name() (static) instead")
+            std::string get_process_name() const { return ML_Logger::process_name(); }
 
+            // 清理旧日志
             void cleanupOldLogs(int daysToKeep = 5)
             {
                 std::lock_guard<std::mutex> lk(_mutex);
@@ -907,10 +1003,33 @@ namespace mllog_v282
                         platform_deleteFile_(dir + name);
             }
 
+            // --------- Pattern API（新增）---------
+            void setPattern(const std::string& pattern)
+            {
+                std::lock_guard<std::mutex> lk(_mutex);
+                _pattern_raw = pattern;
+                _pat_ops.clear();
+                _has_pattern.store(compilePattern_(pattern, _pat_ops), std::memory_order_release);
+            }
+            std::string getPattern()
+            {
+                std::lock_guard<std::mutex> lk(_mutex);
+                return _pattern_raw;
+            }
+            std::string name() const { return _name; }
+
+            void setHealCheckEvery(int n)
+            {
+                std::lock_guard<std::mutex> lk(_mutex);
+                _heal_every = (n > 0 ? n : 0);
+                _heal_counter = 0;
+            }
+
         private:
+            /* -------- 运行时状态 & 内部函数（保留原有结构，略去未改动的注释） -------- */
             enum class Phase_AtomicTag
             {
-            }; // 只为表意
+            };
             Phase phase() const { return (Phase)_phase.load(std::memory_order_acquire); }
             void setPhase_(Phase p) { _phase.store((int)p, std::memory_order_release); }
 
@@ -931,12 +1050,20 @@ namespace mllog_v282
                 std::tm tm{};
                 const char* tc = nullptr;
                 updateAndGetTimeCache_(tm, ms, tc);
-                char prefix[192];
-                int plen = buildPrefix_(prefix, sizeof(prefix), Level::Alert, "mllog.hpp", 0, tc, ms);
                 std::string line;
-                if (plen > 0)
-                    line.append(prefix, (size_t)plen);
-                line.append("---------- Start MLLOG ----------");
+
+                if (_has_pattern)
+                {
+                    renderPattern_(tm, ms, Level::Alert, "mllog.hpp", "mllog.hpp", "?", 0, "---------- Start MLLOG ----------", line);
+                }
+                else
+                {
+                    char prefix[192];
+                    int plen = buildPrefix_(prefix, sizeof(prefix), Level::Alert, "mllog.hpp", 0, tc, ms);
+                    if (plen > 0)
+                        line.append(prefix, (size_t)plen);
+                    line.append("---------- Start MLLOG ----------");
+                }
                 if (_add_newline)
                     line.push_back('\n');
                 enqueuePendingLine_NoIO_UnsafeLocked_(std::move(line));
@@ -959,7 +1086,7 @@ namespace mllog_v282
                 }
                 if (!_initialized || !_file.is_open())
                 {
-                    rollFiles_(true);
+                    rollFiles_();
                     _initialized = true;
                 }
                 if (!_file.is_open())
@@ -1029,12 +1156,12 @@ namespace mllog_v282
                 out_time_c = tls.time_buf;
             }
 
-            static int buildPrefix_(char* buf, size_t cap, Level lv, const char* file, int line, const char* time_c, int ms)
+            static int buildPrefix_(char* buf, size_t cap, Level lv, const char* file_short, int line, const char* time_c, int ms)
             {
 #if defined(_WIN32)
-                return _snprintf(buf, (unsigned)cap, "%s.%03d %s [%s:%d] ", time_c, ms, levelToStringC_(lv), file, line);
+                return _snprintf(buf, (unsigned)cap, "%s.%03d %s [%s:%d] ", time_c, ms, levelToStringC_(lv), file_short, line);
 #else
-                return std::snprintf(buf, cap, "%s.%03d %s [%s:%d] ", time_c, ms, levelToStringC_(lv), file, line);
+                return std::snprintf(buf, cap, "%s.%03d %s [%s:%d] ", time_c, ms, levelToStringC_(lv), file_short, line);
 #endif
             }
 
@@ -1079,17 +1206,13 @@ namespace mllog_v282
                 }
             }
 
-            void formatMessageFast_(Level lv, const char* file, int line,
-                                    const char* time_c, int ms_count,
-                                    const std::string& msg, std::string& out) const
+            // 默认前缀路径（未设置 pattern 时）
+            void formatMessageFast_DefaultPrefix_(Level lv, const char* file_short, int line,
+                                                  const char* time_c, int ms_count,
+                                                  const std::string& msg, std::string& out) const
             {
-                if (_message_only)
-                {
-                    out.assign(msg);
-                    return;
-                }
                 char prefix[192];
-                int plen = buildPrefix_(prefix, sizeof(prefix), lv, file, line, time_c, ms_count);
+                int plen = buildPrefix_(prefix, sizeof(prefix), lv, file_short, line, time_c, ms_count);
                 if (plen < 0)
                 {
                     out.assign(msg);
@@ -1098,69 +1221,6 @@ namespace mllog_v282
                 out.reserve((size_t)plen + msg.size());
                 out.append(prefix, (size_t)plen);
                 out.append(msg);
-            }
-
-            void writeToTargetsFileOnly_(const char* prefix, size_t plen,
-                                         const std::string& msg, bool isNewLine, Level /*lv*/)
-            {
-                struct InLogGuard
-                {
-                    InLogGuard() { ML_Logger::in_logging_flag_() = true; }
-                    ~InLogGuard() { ML_Logger::in_logging_flag_() = false; }
-                } guard;
-                std::lock_guard<std::mutex> lk(_mutex);
-                if (_need_day_switch.exchange(false, std::memory_order_relaxed))
-                    onDayChangeLocked_();
-
-                if (_outputToFile && !_initialized)
-                {
-                    rollFiles_(true);
-                    _initialized = true;
-                }
-                if (!_outputToFile)
-                    return;
-
-                if (!_file.is_open())
-                {
-                    rollFiles_(true);
-                    _initialized = true;
-                    if (!_file.is_open())
-                    {
-                        reportError_("Failed to open file for writing. Prefix lost");
-                        return;
-                    }
-                }
-
-                const size_t msg_size = plen + msg.size() + (isNewLine ? 1u : 0u);
-                if (_currentSize > 0 && (_currentSize + msg_size > _maxSizeInBytes))
-                    rollFiles_();
-
-                const size_t total = msg_size;
-                thread_local std::vector<char> oneline;
-                if (oneline.size() < total)
-                    oneline.resize(total);
-
-                size_t off = 0;
-                std::memcpy(oneline.data() + off, prefix, plen);
-                off += plen;
-                std::memcpy(oneline.data() + off, msg.data(), msg.size());
-                off += msg.size();
-                if (isNewLine)
-                    oneline[off++] = '\n';
-
-                _file.write(oneline.data(), off);
-                if (_auto_flush)
-                    _file.flush();
-                if (_file.bad())
-                {
-                    reportError_("Log write/flush failed (file-only).");
-                    _file.close();
-                    _initialized = false;
-                    return;
-                }
-                _currentSize += msg_size;
-                if (_currentSize >= _maxSizeInBytes)
-                    rollFiles_();
             }
 
             void writeToTargets_(const std::string& formatted, bool isNewLine, Level lv)
@@ -1175,7 +1235,7 @@ namespace mllog_v282
                     onDayChangeLocked_();
                 if (_outputToFile && !_initialized)
                 {
-                    rollFiles_(true);
+                    rollFiles_();
                     _initialized = true;
                 }
                 if (_outputToFile)
@@ -1188,9 +1248,13 @@ namespace mllog_v282
             {
                 if (!_outputToFile)
                     return;
+
+                // NEW: 周期性自愈（POSIX unlink 检测）
+                maybeHealUnlinked_(); // <== 新增
+
                 if (!_file.is_open())
                 {
-                    rollFiles_(true);
+                    rollFiles_();
                     _initialized = true;
                     if (!_file.is_open())
                     {
@@ -1198,22 +1262,59 @@ namespace mllog_v282
                         return;
                     }
                 }
+
                 const size_t msg_size = s.size() + (isNewLine ? 1u : 0u);
                 if (_currentSize > 0 && (_currentSize + msg_size > _maxSizeInBytes))
                     rollFiles_();
 
+                // 写入（一次 append）
                 _file.write(s.data(), s.size());
                 if (isNewLine)
                     _file.put('\n');
+
+                // NEW: 写失败 → 尝试重开同一路径并重试一次
+                if (_file.bad())
+                {
+                    // 保存要重试的数据
+                    const char* p1 = s.data();
+                    size_t len1 = s.size();
+                    char nl = '\n';
+
+                    _file.close();
+                    if (_curFilePath.empty())
+                    {
+                        _initialized = false;
+                        reportError_("Log write failed and no current path.");
+                        return;
+                    }
+
+                    _file.open(_curFilePath, std::ios::out | std::ios::app | std::ios::binary);
+                    if (_file.is_open())
+                    {
+                        _file.write(p1, len1);
+                        if (isNewLine)
+                            _file.put(nl);
+                    }
+
+                    if (_file.bad())
+                    {
+                        reportError_("Log write retry failed.");
+                        _file.close();
+                        _initialized = false; // 让下一次触发 rollFiles_()
+                        return;
+                    }
+                }
+
                 if (_auto_flush)
                     _file.flush();
                 if (_file.bad())
                 {
-                    reportError_("Log write/flush failed.");
+                    reportError_("Log flush failed.");
                     _file.close();
                     _initialized = false;
                     return;
                 }
+
                 _currentSize += msg_size;
                 if (_currentSize >= _maxSizeInBytes)
                     rollFiles_();
@@ -1232,19 +1333,12 @@ namespace mllog_v282
                                        cached = false;
                                        return;
                                    }
-                                   {
-                                       HANDLE h = GetStdHandle((DWORD)-11); // STD_OUTPUT_HANDLE
-                                       DWORD mode = 0;
-                                       if (h && GetConsoleMode(h, &mode))
-                                           if (SetConsoleMode(h, mode | MLLOG_VT_ENABLE))
-                                           {
-                                               cached = true;
-                                               return;
-                                           }
-                                   }
-                                   const char* wt = std::getenv("WT_SESSION");
-                                   const char* term = std::getenv("TERM");
-                                   cached = (wt != nullptr) || (term != nullptr);
+                                   HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+                                   DWORD mode = 0;
+                                   if (h && GetConsoleMode(h, &mode) && SetConsoleMode(h, mode | MLLOG_VT_ENABLE))
+                                       cached = true;
+                                   else
+                                       cached = false;
 #else
                                    cached = ::isatty(STDOUT_FILENO);
 #endif
@@ -1281,9 +1375,11 @@ namespace mllog_v282
                 _currentSize = 0;
                 _start_timestamp = currentTimestamp_();
                 _baseFullNameWithDateAndTime = _baseName + "_" + _start_timestamp;
+                _curFilePath.clear();
+                _heal_counter = 0;
             }
 
-            void rollFiles_(bool /*first*/ = false)
+            void rollFiles_()
             {
                 if (_baseName.empty())
                     return;
@@ -1302,18 +1398,22 @@ namespace mllog_v282
                     _isRoll = true;
                     _currentRollIndex = 1;
                 }
+
                 std::ostringstream fn;
                 fn << _baseFullNameWithDateAndTime << '_' << _currentRollIndex << ".log";
-                _file.open(fn.str(), std::ios::out | (_isRoll ? std::ios::trunc : std::ios::app) | std::ios::binary);
+                _curFilePath = fn.str(); // <== 记录当前文件路径
+                _file.open(_curFilePath, std::ios::out | (_isRoll ? std::ios::trunc : std::ios::app) | std::ios::binary);
                 if (!_file.is_open())
                 {
-                    reportError_(std::string("Failed to open new log file: ") + fn.str());
+                    reportError_(std::string("Failed to open new log file: ") + _curFilePath);
                     _currentSize = 0;
                     return;
                 }
+
                 _file.seekp(0, std::ios::end);
                 std::streampos pos = _file.tellp();
                 _currentSize = (pos >= 0) ? (size_t)pos : 0u;
+                _heal_counter = 0;
             }
 
             std::string currentTimestamp_() const
@@ -1435,10 +1535,8 @@ namespace mllog_v282
                 char buf[1024] = {0};
 #if defined(_WIN32)
                 HMODULE h = nullptr;
-                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                       reinterpret_cast<LPCSTR>(&platform_getModulePath_),
-                                       &h))
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       reinterpret_cast<LPCSTR>(&platform_getModulePath_), &h))
                 {
                     char path[MAX_PATH] = {0};
                     DWORD n = GetModuleFileNameA(h, path, MAX_PATH);
@@ -1470,6 +1568,43 @@ namespace mllog_v282
                 if (getcwd(buf, sizeof(buf)) != nullptr)
                     return std::string(buf);
                 return ".";
+#endif
+            }
+
+            static std::string platform_getModuleBasename_()
+            {
+#if defined(_WIN32)
+                HMODULE h = nullptr;
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       reinterpret_cast<LPCSTR>(&platform_getModuleBasename_), &h))
+                {
+                    char path[MAX_PATH] = {0};
+                    DWORD n = GetModuleFileNameA(h, path, MAX_PATH);
+                    if (n)
+                    {
+                        std::string p(path, n);
+                        size_t pos = p.find_last_of("\\/");
+                        std::string b = (pos == std::string::npos) ? p : p.substr(pos + 1);
+                        size_t dot = b.rfind('.');
+                        if (dot != std::string::npos)
+                            b.resize(dot);
+                        return b;
+                    }
+                }
+                return platform_getProcessName_();
+#else
+                Dl_info info{};
+                if (dladdr((void*)(&platform_getModuleBasename_), &info) && info.dli_fname)
+                {
+                    std::string p(info.dli_fname);
+                    size_t pos = p.find_last_of('/');
+                    std::string b = (pos == std::string::npos) ? p : p.substr(pos + 1);
+                    size_t dot = b.rfind('.');
+                    if (dot != std::string::npos)
+                        b.resize(dot);
+                    return b;
+                }
+                return platform_getProcessName_();
 #endif
             }
 
@@ -1622,9 +1757,340 @@ namespace mllog_v282
                 return std::mktime(&tmv);
             }
 
+            // ---------- Pattern 引擎（NEW） ----------
+            enum class PatType
+            {
+                Lit,
+                DateChunk,
+                Ms,
+                LevelShort,
+                LevelLong,
+                LoggerName,
+                PID,
+                TID,
+                FileShort,
+                FileFull,
+                Line,
+                Func,
+                Message,
+                ColorStart,
+                ColorStop
+            };
+
+            struct PatOp
+            {
+                PatType type;
+                std::string text;
+            };
+
+            // 编译 pattern 为 token 序列；把时间片段（含多种 %X 与字面）聚合成单个 DateChunk
+            static bool is_time_spec_char_(char c)
+            {
+                return std::isalpha(static_cast<unsigned char>(c)) ? true : false;
+            }
+
+            bool compilePattern_(const std::string& p, std::vector<PatOp>& out)
+            {
+                if (p.empty())
+                    return false;
+                out.clear();
+                std::string lit, datechunk;
+                auto flush_lit = [&]()
+                { if (!lit.empty()) { out.push_back({ PatType::Lit, lit }); lit.clear(); } };
+                auto flush_date = [&]()
+                { if (!datechunk.empty()) { out.push_back({ PatType::DateChunk, datechunk }); datechunk.clear(); } };
+
+                for (size_t i = 0; i < p.size(); ++i)
+                {
+                    if (p[i] != '%')
+                    {
+                        if (!datechunk.empty())
+                            datechunk.push_back(p[i]);
+                        else
+                            lit.push_back(p[i]);
+                        continue;
+                    }
+                    if (i + 1 >= p.size())
+                    {
+                        (datechunk.empty() ? lit : datechunk).push_back('%');
+                        break;
+                    }
+                    char c = p[i + 1];
+                    i++;
+                    switch (c)
+                    {
+                    case 'v':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::Message, {}});
+                        break;
+                    case 'l':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::LevelShort, {}});
+                        break;
+                    case 'L':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::LevelLong, {}});
+                        break;
+                    case 'n':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::LoggerName, {}});
+                        break;
+                    case 'P':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::PID, {}});
+                        break;
+                    case 't':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::TID, {}});
+                        break;
+                    case 's':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::FileShort, {}});
+                        break;
+                    case 'g':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::FileFull, {}});
+                        break; // [NEW] 全路径
+                    case '#':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::Line, {}});
+                        break;
+                    case '!':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::Func, {}});
+                        break; // [NEW] 函数名
+                    case '^':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::ColorStart, {}});
+                        break;
+                    case '$':
+                        flush_date();
+                        flush_lit();
+                        out.push_back({PatType::ColorStop, {}});
+                        break;
+                    case 'e': // 毫秒
+                        if (!datechunk.empty())
+                        {
+                            datechunk += "%e";
+                        }
+                        else
+                        {
+                            flush_lit();
+                            out.push_back({PatType::Ms, {}});
+                        }
+                        break;
+                    default:
+                        if (datechunk.empty())
+                            flush_lit();
+                        datechunk.push_back('%');
+                        datechunk.push_back(c);
+                        if (!is_time_spec_char_(c))
+                        {
+                        }
+                        break;
+                    }
+                }
+                flush_date();
+                flush_lit();
+                return !out.empty();
+            }
+
+            void renderPattern_(const std::tm& tmv, int ms, Level lv,
+                                const char* file_short, const char* file_full, const char* func, int line,
+                                const std::string& msg, std::string& out) const
+            {
+                const char* level_str = levelToStringC_(lv);
+#if defined(_WIN32)
+                const unsigned pid = GetCurrentProcessId();
+#else
+                const unsigned pid = (unsigned)getpid();
+#endif
+                const unsigned tid = (unsigned)std::hash<std::thread::id>{}(std::this_thread::get_id());
+
+                for (const auto& op : _pat_ops)
+                {
+                    switch (op.type)
+                    {
+                    case PatType::Lit:
+                        out.append(op.text);
+                        break;
+                    case PatType::LevelShort:
+                    case PatType::LevelLong:
+                        out.append(level_str);
+                        break;
+                    case PatType::LoggerName:
+                        out.append(_name);
+                        break;
+                    case PatType::PID:
+                    {
+                        char b[32];
+                        int n = std::snprintf(b, sizeof(b), "%u", pid);
+                        if (n > 0)
+                            out.append(b, n);
+                    }
+                    break;
+                    case PatType::TID:
+                    {
+                        char b[32];
+                        int n = std::snprintf(b, sizeof(b), "%u", tid);
+                        if (n > 0)
+                            out.append(b, n);
+                    }
+                    break;
+                    case PatType::FileShort:
+                        out.append(file_short ? file_short : "?");
+                        break;
+                    case PatType::FileFull:
+                        out.append(file_full ? file_full : "?");
+                        break;
+                    case PatType::Line:
+                    {
+                        char b[16];
+                        int n = std::snprintf(b, sizeof(b), "%d", line);
+                        if (n > 0)
+                            out.append(b, n);
+                    }
+                    break;
+                    case PatType::Func:
+                        out.append(func ? func : "?");
+                        break;
+                    case PatType::Message:
+                        out.append(msg);
+                        break;
+                    case PatType::Ms:
+                    {
+                        char b[8];
+                        int n = std::snprintf(b, sizeof(b), "%03d", ms);
+                        if (n > 0)
+                            out.append(b, n);
+                    }
+                    break;
+                    case PatType::DateChunk:
+                    {
+                        // 处理 %e（毫秒）占位：先把 %e 替换为 @@@ ，strftime 后再二次替换为真正数值
+                        std::string tmp;
+                        tmp.reserve(op.text.size() + 8);
+                        for (size_t i = 0; i < op.text.size(); ++i)
+                        {
+                            if (op.text[i] == '%' && i + 1 < op.text.size() && op.text[i + 1] == 'e')
+                            {
+                                tmp += "@@@";
+                                ++i;
+                            }
+                            else
+                                tmp.push_back(op.text[i]);
+                        }
+                        size_t cap = 128;
+                        std::string buf(cap, '\0');
+                        size_t n = 0;
+                        for (;;)
+                        {
+                            n = std::strftime(&buf[0], buf.size(), tmp.c_str(), &tmv);
+                            if (n > 0)
+                                break;
+                            cap <<= 1;
+                            if (cap > 4096)
+                                break; // 安全上限
+                            buf.assign(cap, '\0');
+                        }
+                        if (n > 0)
+                        {
+                            std::string t2;
+                            t2.reserve(n + 4);
+                            for (size_t j = 0; j < n;)
+                            {
+                                if (j + 3 <= n && std::memcmp(buf.data() + j, "@@@", 3) == 0)
+                                {
+                                    char b[8];
+                                    int k = std::snprintf(b, sizeof(b), "%03d", ms);
+                                    if (k > 0)
+                                        t2.append(b, k);
+                                    j += 3;
+                                }
+                                else
+                                {
+                                    t2.push_back(buf[j++]);
+                                }
+                            }
+                            out.append(t2);
+                        }
+                    }
+                    break;
+                    case PatType::ColorStart:
+                    case PatType::ColorStop:
+                        // 忽略（仍采用整行按级别上色，不污染文件）
+                        break;
+                    }
+                }
+            }
+            void maybeHealUnlinked_()
+            {
+#if defined(_WIN32)
+                (void)0;
+#else
+                if (_heal_every <= 0 || !_outputToFile || !_file.is_open() || _curFilePath.empty())
+                    return;
+                if (++_heal_counter < _heal_every)
+                    return;
+                _heal_counter = 0;
+
+                // 先取“路径是否存在 + inode 是否匹配”
+                bool need_reopen = false;
+                struct stat st_path{};
+                if (::stat(_curFilePath.c_str(), &st_path) != 0)
+                {
+                    // 路径不存在（被 unlink）
+                    need_reopen = true;
+                }
+                else
+                {
+                    int fd = _file.native_fileno(); // <== 需要补丁 A
+                    if (fd >= 0)
+                    {
+                        struct stat st_fd{};
+                        if (::fstat(fd, &st_fd) == 0)
+                        {
+                            // dev/inode 变化 => 我们拿的是“旧文件”，路径上是“新文件”
+                            if (st_fd.st_dev != st_path.st_dev || st_fd.st_ino != st_path.st_ino)
+                                need_reopen = true;
+                        }
+                    }
+                }
+
+                if (need_reopen)
+                {
+                    _file.close();
+                    _file.open(_curFilePath, std::ios::out | std::ios::app | std::ios::binary);
+                    if (_file.is_open())
+                    {
+                        _file.seekp(0, std::ios::end);
+                        std::streampos pos = _file.tellp();
+                        _currentSize = (pos >= 0) ? (size_t)pos : 0u;
+                    }
+                    else
+                    {
+                        reportError_(std::string("Heal reopen failed: ") + _curFilePath);
+                        _initialized = false; // 让后续写入触发 rollFiles_()
+                    }
+                }
+#endif
+            }
+
         private:
             ML_FastOFStream _file;
             std::mutex _mutex;
+            std::string _name; // [NEW] 实例名（%n）
             std::string _baseName;
             std::string _baseNameWithoutPath;
             std::string _baseFullNameWithDateAndTime;
@@ -1646,7 +2112,6 @@ namespace mllog_v282
             std::string _start_timestamp;
             std::atomic<int> _last_log_ymd;
             bool _auto_flush;
-            std::time_t _cached_time_sec;
             std::atomic<bool> _need_day_switch;
             ErrorHandler _error_handler;
             static constexpr size_t PENDING_MAX_BYTES = 4u * 1024u * 1024u;
@@ -1655,6 +2120,15 @@ namespace mllog_v282
             size_t _pending_bytes;
             std::atomic<int> _phase;
 
+            // Pattern 状态
+            std::string _pattern_raw;    // [NEW]
+            std::vector<PatOp> _pat_ops; // [NEW]
+            std::atomic<bool> _has_pattern{false};
+
+            std::string _curFilePath; // 当前打开并写入的文件完整路径
+            int _heal_every = 256;    // 每写多少行做一次自愈检查（0=关闭）
+            int _heal_counter = 0;    // 计数器
+
             static bool& in_logging_flag_()
             {
                 thread_local bool flag = false;
@@ -1662,7 +2136,7 @@ namespace mllog_v282
             }
         };
 
-        /* =================== Registry 方法定义（放在 ML_Logger 之后） =================== */
+        /* =================== Registry 方法定义 =================== */
         inline ML_LoggerRegistry& ML_LoggerRegistry::getInstance()
         {
             static ML_LoggerRegistry* p = new ML_LoggerRegistry(); // 永不析构
@@ -1673,24 +2147,25 @@ namespace mllog_v282
             std::lock_guard<std::mutex> lock(_mutex);
             auto it = _loggers.find(name);
             if (it == _loggers.end())
-                it = _loggers.emplace(name, std::unique_ptr<ML_Logger>(new ML_Logger())).first;
+                it = _loggers.emplace(name, std::unique_ptr<ML_Logger>(new ML_Logger(name))).first; // [CHG]
             return *it->second;
         }
         inline ML_LoggerRegistry::~ML_LoggerRegistry() = default;
 
-        /* ========================= 日志流 ========================= */
+        /* ========================= 日志流（携带 短/全文件+函数） ========================= */
         class LoggerStream
         {
         public:
-            LoggerStream(ML_Logger& logger, ML_Logger::Level lv, const char* file, int line)
-                : _logger(logger), _lv(lv), _file(file), _line(line)
+            LoggerStream(ML_Logger& logger, ML_Logger::Level lv,
+                         const char* file_short, const char* file_full, const char* func, int line)
+                : _logger(logger), _lv(lv), _file_short(file_short), _file_full(file_full), _func(func), _line(line)
             {
                 if (_buf.capacity() < 256)
                     _buf.reserve(256);
                 _buf.clear();
             }
 
-            ~LoggerStream() { _logger.log(_file, _line, _lv, _buf, _logger.getAddNewLine()); }
+            ~LoggerStream() { _logger.log(_file_short, _file_full, _func, _line, _lv, _buf, _logger.getAddNewLine()); }
 
             LoggerStream& operator<<(const std::string& s)
             {
@@ -1836,29 +2311,36 @@ namespace mllog_v282
         private:
             ML_Logger& _logger;
             ML_Logger::Level _lv;
-            const char* _file;
+            const char* _file_short;
+            const char* _file_full; // [NEW]
+            const char* _func;      // [NEW]
             int _line;
             std::string _buf;
         };
+    } // inline namespace v2_9_1
+} // namespace mllog_v291
 
-    } // inline namespace v2_8_2
-} // namespace mllog_v282
 #if !defined(_WIN32)
 #pragma GCC visibility pop
 #endif
+
 /* ========================= 版本选择宏（全局定义） ========================= */
 #ifndef ML_NS
-#define ML_NS ::mllog_v282::v2_8_2
+#define ML_NS ::mllog_v291::v2_9_1
 #endif
 
-/* ========================= 宏接口（引用命名空间内符号） ========================= */
-#define MLSHORT_FILE ML_NS::mllog_file_name_from_path(__FILE__)
-#define MLLOG_STREAM(logger, level) ML_NS::LoggerStream(logger, level, MLSHORT_FILE, __LINE__)
+/* ========================= 宏接口 ========================= */
+// [NEW] 同时提供短/全路径与函数名
+#define MLFILE_SHORT ML_NS::mllog_file_name_from_path(__FILE__)
+#define MLFILE_FULL __FILE__
+#define MLFUNC __func__
 
-#define MLLOGF_FORMAT(logger, level, fmt, ...)                                 \
-    do                                                                         \
-    {                                                                          \
-        (logger).logformat(MLSHORT_FILE, __LINE__, level, fmt, ##__VA_ARGS__); \
+#define MLLOG_STREAM(logger, level) ML_NS::LoggerStream(logger, level, MLFILE_SHORT, MLFILE_FULL, MLFUNC, __LINE__)
+
+#define MLLOGF_FORMAT(logger, level, fmt, ...)                                                      \
+    do                                                                                              \
+    {                                                                                               \
+        (logger).logformat(MLFILE_SHORT, MLFILE_FULL, MLFUNC, __LINE__, level, fmt, ##__VA_ARGS__); \
     } while (0)
 
 /* 默认 logger ("default") */
@@ -1936,7 +2418,12 @@ namespace mllog_v282
 #define MLLOG_CRITICAL_NAMED(name) MLLOG_NAMED(name, ML_NS::ML_Logger::Level::Critical)
 #define MLLOG_ALERT_NAMED(name) MLLOG_NAMED(name, ML_NS::ML_Logger::Level::Alert)
 
-#define MLLOGF_NAMED(name, level, fmt, ...) MLLOGF_FORMAT(ML_NS::ML_Logger::get(name), level, fmt, ##__VA_ARGS__)
+#define MLLOGF_NAMED(name, level, fmt, ...)                                                                            \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        ML_NS::ML_Logger::get(name).logformat(MLFILE_SHORT, MLFILE_FULL, MLFUNC, __LINE__, level, fmt, ##__VA_ARGS__); \
+    } while (0)
+
 #define MLLOG_DEBUGF_NAMED(name, fmt, ...) MLLOGF_NAMED(name, ML_NS::ML_Logger::Level::Debug, fmt, ##__VA_ARGS__)
 #define MLLOG_INFOF_NAMED(name, fmt, ...) MLLOGF_NAMED(name, ML_NS::ML_Logger::Level::Info, fmt, ##__VA_ARGS__)
 #define MLLOG_NOTICEF_NAMED(name, fmt, ...) MLLOGF_NAMED(name, ML_NS::ML_Logger::Level::Notice, fmt, ##__VA_ARGS__)
@@ -1945,10 +2432,7 @@ namespace mllog_v282
 #define MLLOG_CRITICALF_NAMED(name, fmt, ...) MLLOGF_NAMED(name, ML_NS::ML_Logger::Level::Critical, fmt, ##__VA_ARGS__)
 #define MLLOG_ALERTF_NAMED(name, fmt, ...) MLLOGF_NAMED(name, ML_NS::ML_Logger::Level::Alert, fmt, ##__VA_ARGS__)
 
-/* ===== 可选：在不并存多版本的工程里，把类名引回全局（默认关闭） =====
-   使用方式：对单一版本、且确认不会与其他版本同进程并存时，在编译指令里加
-   -DMLLOG_LEGACY_GLOBALS=1
-*/
+/* ===== 可选：旧名导出（仅在不并存多版本时启用） ===== */
 #if defined(MLLOG_LEGACY_GLOBALS) && MLLOG_LEGACY_GLOBALS
 using ML_Logger = ML_NS::ML_Logger;
 using ML_LoggerRegistry = ML_NS::ML_LoggerRegistry;
