@@ -50,7 +50,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
-
+using namespace ML_NS;
 int main() {
     // 1. 启动日志系统 (必须)
     MLLOG_START();
@@ -85,7 +85,7 @@ int main() {
 ```cpp
 #include "mllog.hpp"
 #include <iostream>
-
+using namespace ML_NS;
 // 自定义日志库内部错误处理器
 void handle_log_system_error(const std::string& error_message) {
     // 在生产环境中，这里可以发送警报或写入紧急日志

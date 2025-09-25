@@ -50,7 +50,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
-
+using namespace ML_NS;
 int main() {
     // 1. Start the logging system (required)
     MLLOG_START();
@@ -85,7 +85,7 @@ int main() {
 ```cpp
 #include "mllog.hpp"
 #include <iostream>
-
+using namespace ML_NS;
 // Custom handler for MLLog's internal errors
 void handle_log_system_error(const std::string& error_message) {
     // In a production environment, you might send an alert or write to an emergency log
